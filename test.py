@@ -1,50 +1,50 @@
-import asyncio
-from mavsdk import System
-from mavsdk.offboard import Attitude, OffboardError
+import time
+from pymavlink import mavutil
 
-async def run():
-    drone = System()
-    await drone.connect(system_address="serial:///dev/ttyACM0:57600")
+# Connect to Pixhawk
+master = mavutil.mavlink_connection('/dev/ttyACM0', baud=57600)
+print("Waiting for heartbeat...")
+master.wait_heartbeat()
+print(f"Connected! (system {master.target_system}, comp {master.target_component})")
 
-    print("Waiting for drone...")
-    async for state in drone.core.connection_state():
-        if state.is_connected:
-            print("Connected!")
-            break
+# Force arm (bypass all checks)
+print("Arming...")
+master.arducopter_arm()
+# Or if that doesn't work:
+# master.mav.command_long_send(
+#     master.target_system, master.target_component,
+#     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+#     0, 1, 21196, 0, 0, 0, 0, 0)  # 21196 = force arm
 
-    await asyncio.sleep(3)
+master.motors_armed_wait()
+print("Armed!")
 
-    # Send several setpoints before starting offboard
-    print("Sending setpoints...")
-    for i in range(20):
-        await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.0))
-        await asyncio.sleep(0.1)
+# Send throttle via RC override (channel 3 = throttle)
+# 1000 = min, 1500 = mid, 2000 = max
+print("Spinning motors at low throttle...")
+for i in range(50):
+    master.mav.rc_channels_override_send(
+        master.target_system, master.target_component,
+        0, 0, 1200, 0, 0, 0, 0, 0)  # ch3=1200 (low throttle)
+    time.sleep(0.1)
 
-    print("Starting offboard...")
-    try:
-        await drone.offboard.start()
-        print("Offboard started!")
-    except OffboardError as e:
-        print(f"Offboard failed: {e}")
-        return
+print("Motors running for 5 seconds...")
+time.sleep(5)
 
-    print("Arming...")
-    await drone.action.arm()
-    print("Armed!")
+# Stop
+print("Stopping...")
+master.mav.rc_channels_override_send(
+    master.target_system, master.target_component,
+    0, 0, 1000, 0, 0, 0, 0, 0)  # ch3=1000 (min)
+time.sleep(1)
 
-    # Now ramp up throttle
-    print("Spinning motors...")
-    for i in range(20):
-        await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.2))
-        await asyncio.sleep(0.1)
+# Disarm
+print("Disarming...")
+master.arducopter_disarm()
+# Force disarm if needed:
+# master.mav.command_long_send(
+#     master.target_system, master.target_component,
+#     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+#     0, 0, 21196, 0, 0, 0, 0, 0)
 
-    # Hold for 5 seconds
-    await asyncio.sleep(5)
-
-    print("Stopping...")
-    await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.0))
-    await asyncio.sleep(1)
-    await drone.action.kill()
-    print("Done.")
-
-asyncio.run(run())
+print("Done.")
