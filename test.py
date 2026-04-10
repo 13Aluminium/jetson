@@ -1,5 +1,6 @@
 import asyncio
 from mavsdk import System
+from mavsdk.offboard import Attitude, OffboardError
 
 async def run():
     drone = System()
@@ -11,20 +12,37 @@ async def run():
             print("Connected!")
             break
 
-    # Give it a moment to sync
     await asyncio.sleep(3)
 
-    print("Arming...")
-    try:
-        await drone.action.arm()
-        print("Armed!")
-    except Exception as e:
-        print(f"Arm failed: {e}")
+    # Set initial setpoint before starting offboard
+    print("Setting initial setpoint...")
+    await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.2))
 
+    print("Arming...")
+    await drone.action.arm()
+    print("Armed!")
+
+    print("Starting offboard...")
+    try:
+        await drone.offboard.start()
+        print("Offboard started — motors should spin!")
+    except OffboardError as e:
+        print(f"Offboard failed: {e}")
+        await drone.action.kill()
+        return
+
+    # Spin for 5 seconds
     await asyncio.sleep(5)
 
-    print("Disarming...")
-    await drone.action.disarm()
+    # Throttle down then kill
+    print("Stopping...")
+    await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.0))
+    await asyncio.sleep(1)
+    try:
+        await drone.offboard.stop()
+    except:
+        pass
+    await drone.action.kill()
     print("Done.")
 
 asyncio.run(run())
