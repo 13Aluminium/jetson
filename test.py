@@ -1,57 +1,47 @@
 import asyncio
 from mavsdk import System
-from mavsdk.offboard import OffboardError, ActuatorControl
+from mavsdk.offboard import Attitude, OffboardError
 
 async def run():
     drone = System()
-    await drone.connect(system_address="udp://:14540")
+    await drone.connect(system_address="serial:///dev/ttyACM0:57600")
 
+    # Wait for connection
     print("Waiting for drone...")
     async for state in drone.core.connection_state():
         if state.is_connected:
             print("Connected!")
             break
 
-    print("Waiting for global position estimate...")
+    # Wait for position estimate
+    print("Waiting for position estimate...")
     async for health in drone.telemetry.health():
-        if health.is_armable:
-            print("Drone is armable")
+        if health.is_global_position_ok and health.is_home_position_ok:
+            print("Position OK")
             break
 
+    # Set initial setpoint before starting offboard
+    await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.15))
+
+    # Arm
     print("Arming...")
     await drone.action.arm()
+    print("Armed!")
 
-    # Neutral actuator values (0 = no movement)
-    neutral = [0.0] * 8
+    # Start offboard
+    print("Starting offboard...")
+    await drone.offboard.start()
+    print("Motors spinning!")
 
-    try:
-        print("Starting offboard mode...")
-        await drone.offboard.set_actuator_control(ActuatorControl([neutral, neutral]))
-        await drone.offboard.start()
-    except OffboardError as e:
-        print(f"Offboard start failed: {e}")
-        await drone.action.disarm()
-        return
+    # Run for 5 seconds
+    await asyncio.sleep(5)
 
-    print("Spinning motors slowly...")
-    # Small throttle value (0.1 = very low power)
-    motor_test = [0.1, 0.1, 0.1, 0.1, 0.0, 0.0, 0.0, 0.0]
-
-    await drone.offboard.set_actuator_control(
-        ActuatorControl([motor_test, neutral])
-    )
-
-    await asyncio.sleep(5)  # run motors for 5 seconds
-
-    print("Stopping motors...")
-    await drone.offboard.set_actuator_control(
-        ActuatorControl([neutral, neutral])
-    )
-
+    # Stop
+    print("Stopping...")
+    await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.0))
+    await asyncio.sleep(0.5)
     await drone.offboard.stop()
-
-    print("Disarming...")
     await drone.action.disarm()
+    print("Done.")
 
-if __name__ == "__main__":
-    asyncio.run(run())
+asyncio.run(run())
