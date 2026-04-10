@@ -12,12 +12,14 @@ async def run():
             print("Connected!")
             break
 
-    # Force arm without GPS
-    await drone.action.set_force_arm(True)
+    # Disable arming checks via params
+    await drone.param.set_param_int("COM_ARM_WO_GPS", 1)
+    await drone.param.set_param_int("COM_ARM_EKF_CHECK", 0)
+    print("Arming checks disabled")
 
     await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.15))
 
-    print("Force arming...")
+    print("Arming...")
     await drone.action.arm()
     print("Armed!")
 
