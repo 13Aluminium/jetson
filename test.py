@@ -4,6 +4,13 @@ from pymavlink import mavutil
 master = mavutil.mavlink_connection('/dev/ttyACM0', baud=115200)
 print("Waiting for heartbeat...")
 master.wait_heartbeat()
+print("Connected!")
+print("Done.")import time
+from pymavlink import mavutil
+
+master = mavutil.mavlink_connection('/dev/ttyACM0', baud=115200)
+print("Waiting for heartbeat...")
+master.wait_heartbeat()
 master.target_component = 1
 print(f"Connected! system={master.target_system}")
 
