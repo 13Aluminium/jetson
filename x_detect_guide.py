@@ -2,28 +2,25 @@
 """
 X Target Detector + Centering Guide — Jetson Orin Nano + IMX477
 ================================================================
-Modes:
-  --stream       Video in browser at http://<jetson-ip>:5000, guidance in terminal
-  --headless     Terminal only, no video
-  --snapshot     Single frame, saves annotated image
+Shows live video on the connected monitor with:
+  - Bounding box around detected X
+  - Red/green dot at X center
+  - Crosshair at frame center
+  - Line connecting the two
+  - Direction arrows on screen
 
-The stream mode uses Flask MJPEG — no GTK/display needed. Just open
-the URL on any device on the same network.
+Terminal also prints movement guidance.
 
 Center-finding methods:
-  1. BBOX center (default): Uses YOLO bounding box midpoint.
+  1. BBOX center (default): YOLO bounding box midpoint.
   2. Refined (--refine): Green segmentation within bbox for precise crossing point.
 
-Usage:
-    python3 x_detect_guide.py --stream
-    python3 x_detect_guide.py --stream --refine
-    python3 x_detect_guide.py --stream --refine --deadzone 80
-    python3 x_detect_guide.py --headless
-    python3 x_detect_guide.py --snapshot
-    python3 x_detect_guide.py --save-debug
-
-Install (one time):
-    pip3 install flask
+Usage (run on Jetson with monitor):
+    python3 x_detect_guide.py
+    python3 x_detect_guide.py --refine
+    python3 x_detect_guide.py --deadzone 80
+    python3 x_detect_guide.py --headless          # terminal only, no window
+    python3 x_detect_guide.py --snapshot           # single frame + save
 
 Transfer:
     scp x_detect_guide.py best_22.pt jetson@<ip>:~/
@@ -34,7 +31,6 @@ import time
 import cv2
 import os
 import numpy as np
-import threading
 from datetime import datetime
 
 
@@ -107,34 +103,27 @@ def load_model(weights="best_22.pt"):
 def find_x_center_bbox(box):
     """Simple bounding box midpoint."""
     x1, y1, x2, y2 = map(int, box.xyxy[0])
-    cx = (x1 + x2) // 2
-    cy = (y1 + y2) // 2
-    return cx, cy
+    return (x1 + x2) // 2, (y1 + y2) // 2
 
 
 def find_x_center_refined(frame, box):
     """
     Green-segmentation within YOLO bbox.
-    Crops bbox, thresholds for green tape in HSV, computes centroid.
-    Falls back to bbox center if not enough green pixels found.
+    Crops bbox, thresholds for green tape in HSV, computes centroid
+    of green pixels (naturally lands at the crossing point).
+    Falls back to bbox center if not enough green found.
     """
     x1, y1, x2, y2 = map(int, box.xyxy[0])
-
     h, w = frame.shape[:2]
-    x1c = max(0, x1)
-    y1c = max(0, y1)
-    x2c = min(w, x2)
-    y2c = min(h, y2)
+    x1c, y1c = max(0, x1), max(0, y1)
+    x2c, y2c = min(w, x2), min(h, y2)
 
     crop = frame[y1c:y2c, x1c:x2c]
     if crop.size == 0:
         return find_x_center_bbox(box)
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-
-    lower_green = np.array([35, 40, 40])
-    upper_green = np.array([85, 255, 255])
-    mask = cv2.inRange(hsv, lower_green, upper_green)
+    mask = cv2.inRange(hsv, np.array([35, 40, 40]), np.array([85, 255, 255]))
 
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -144,151 +133,44 @@ def find_x_center_refined(frame, box):
     if len(coords) < 50:
         return find_x_center_bbox(box)
 
-    centroid_y = int(np.mean(coords[:, 0]))
-    centroid_x = int(np.mean(coords[:, 1]))
-
-    cx = x1c + centroid_x
-    cy = y1c + centroid_y
-    return cx, cy
+    # coords are (row, col) = (y, x)
+    return x1c + int(np.mean(coords[:, 1])), y1c + int(np.mean(coords[:, 0]))
 
 
 # ---------------------------------------------------------------------------
 # Centering guidance
 # ---------------------------------------------------------------------------
 def compute_guidance(cx, cy, frame_w, frame_h, deadzone=50):
-    """
-    Returns:
-        direction_str, dx, dy, centered
-    """
     mid_x = frame_w // 2
     mid_y = frame_h // 2
-
-    dx = cx - mid_x  # positive = X is RIGHT of center
-    dy = cy - mid_y  # positive = X is BELOW center
+    dx = cx - mid_x   # positive = X is RIGHT of center
+    dy = cy - mid_y   # positive = X is BELOW center
 
     if abs(dx) <= deadzone and abs(dy) <= deadzone:
         return "CENTERED", dx, dy, True
 
     parts = []
-
     if dx < -deadzone:
-        parts.append(f"<< LEFT  ({abs(dx)}px)")
+        parts.append(f"<< LEFT ({abs(dx)}px)")
     elif dx > deadzone:
         parts.append(f">> RIGHT ({abs(dx)}px)")
     else:
         parts.append("H:OK")
 
     if dy < -deadzone:
-        parts.append(f"^^ UP    ({abs(dy)}px)")
+        parts.append(f"^^ UP ({abs(dy)}px)")
     elif dy > deadzone:
-        parts.append(f"vv DOWN  ({abs(dy)}px)")
+        parts.append(f"vv DOWN ({abs(dy)}px)")
     else:
         parts.append("V:OK")
 
-    return "  |  ".join(parts), dx, dy, False
+    return " | ".join(parts), dx, dy, False
 
 
 # ---------------------------------------------------------------------------
-# Annotate a frame for display (bboxes, center dot, crosshair, guide line)
+# Live mode — cv2.imshow on local monitor + terminal guidance
 # ---------------------------------------------------------------------------
-def annotate_frame(display_frame, results, frame_w, frame_h,
-                   conf_thresh=0.50, scale_x=1.0, scale_y=1.0,
-                   refine=False, raw_frame=None, deadzone=50,
-                   display_fps=0.0):
-    """
-    Draws on display_frame:
-      - frame center crosshair
-      - all bounding boxes
-      - X center dot (green=centered, red=off)
-      - line from X center to frame center
-      - FPS overlay
-
-    Returns: (annotated_frame, det_count, guidance_info)
-        guidance_info = (cx, cy, dx, dy, direction_str, centered) or None
-    """
-    guidance_info = None
-
-    # frame center crosshair
-    smid_x = int((frame_w / 2) * scale_x)
-    smid_y = int((frame_h / 2) * scale_y)
-    cv2.line(display_frame, (smid_x - 25, smid_y), (smid_x + 25, smid_y),
-             (200, 200, 200), 1)
-    cv2.line(display_frame, (smid_x, smid_y - 25), (smid_x, smid_y + 25),
-             (200, 200, 200), 1)
-    cv2.circle(display_frame, (smid_x, smid_y), 6, (200, 200, 200), 1)
-
-    # find best detection
-    best_box = None
-    best_conf = 0.0
-    best_result = None
-    detections = 0
-
-    for result in results:
-        for box in result.boxes:
-            conf = float(box.conf[0])
-            if conf < conf_thresh:
-                continue
-            detections += 1
-            if conf > best_conf:
-                best_conf = conf
-                best_box = box
-                best_result = result
-
-            # draw bbox
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cls_id = int(box.cls[0])
-            cls_name = result.names[cls_id]
-
-            dx1 = int(x1 * scale_x)
-            dy1 = int(y1 * scale_y)
-            dx2 = int(x2 * scale_x)
-            dy2 = int(y2 * scale_y)
-
-            cv2.rectangle(display_frame, (dx1, dy1), (dx2, dy2), (0, 255, 0), 2)
-            label = f"{cls_name} {conf:.2f}"
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            cv2.rectangle(display_frame, (dx1, dy1 - label_size[1] - 10),
-                          (dx1 + label_size[0], dy1), (0, 255, 0), -1)
-            cv2.putText(display_frame, label, (dx1, dy1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-
-    # guidance for best detection
-    if best_box is not None:
-        if refine and raw_frame is not None:
-            cx, cy = find_x_center_refined(raw_frame, best_box)
-        else:
-            cx, cy = find_x_center_bbox(best_box)
-
-        direction_str, dx, dy, centered = compute_guidance(
-            cx, cy, frame_w, frame_h, deadzone
-        )
-        guidance_info = (cx, cy, dx, dy, direction_str, centered)
-
-        # draw X center dot on display
-        dcx = int(cx * scale_x)
-        dcy = int(cy * scale_y)
-        color = (0, 255, 0) if centered else (0, 0, 255)
-        cv2.circle(display_frame, (dcx, dcy), 8, color, -1)
-        cv2.circle(display_frame, (dcx, dcy), 10, (255, 255, 255), 2)
-
-        # line from X center to frame center
-        cv2.line(display_frame, (dcx, dcy), (smid_x, smid_y), color, 2)
-
-    # FPS overlay
-    method_tag = "refined" if refine else "bbox"
-    info = f"FPS: {display_fps:.1f} | X: {detections} | {method_tag}"
-    cv2.putText(display_frame, info, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-    return display_frame, detections, guidance_info
-
-
-# ---------------------------------------------------------------------------
-# Stream mode — Flask MJPEG server + terminal guidance
-# ---------------------------------------------------------------------------
-def run_stream(args):
-    from flask import Flask, Response
-
+def run_live(args):
     print("[*] Loading X detection model...")
     model = load_model(args.weights)
 
@@ -301,160 +183,179 @@ def run_stream(args):
 
     if not cap.isOpened():
         print("[!] Failed to open camera.")
+        print("    Check: ls /dev/video0")
+        print("    Check: sudo systemctl restart nvargus-daemon")
         return
 
-    # shared state between capture thread and flask
-    lock = threading.Lock()
-    latest_jpeg = [None]
-    running = [True]
-
     view_w, view_h = 960, 540
+    window_name = "X Detector — Centering Guide"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, view_w, view_h)
 
-    fps_count = [0]
-    fps_start = [time.time()]
-    display_fps = [0.0]
-    debug_saved = [False]
+    fps_count = 0
+    fps_start = time.time()
+    display_fps = 0
+    debug_saved = False
 
     method_tag = "REFINED" if args.refine else "BBOX"
-    print(f"[*] Stream mode (conf={args.conf}, imgsz={args.imgsz}, "
+    print(f"[*] Running (conf={args.conf}, imgsz={args.imgsz}, "
           f"method={method_tag}, deadzone={args.deadzone}px)")
     print(f"    Frame center: ({infer_w // 2}, {infer_h // 2})")
-    print(f"")
-    print(f"    ============================================")
-    print(f"    Open in browser: http://<jetson-ip>:{args.port}")
-    print(f"    ============================================")
-    print(f"")
+    print(f"    Press 'q' to quit, 's' to snapshot.")
     print("-" * 70)
 
-    def capture_loop():
-        while running[0]:
+    try:
+        while True:
             ret, frame = cap.read()
             if not ret:
-                time.sleep(0.05)
+                time.sleep(0.1)
                 continue
 
-            if args.save_debug and not debug_saved[0]:
+            if args.save_debug and not debug_saved:
                 cv2.imwrite("debug_raw_frame.jpg", frame,
                             [cv2.IMWRITE_JPEG_QUALITY, 95])
                 print(f"[DEBUG] Saved: debug_raw_frame.jpg "
                       f"({frame.shape[1]}x{frame.shape[0]})")
-                debug_saved[0] = True
+                debug_saved = True
 
-            frame_h_px, frame_w_px = frame.shape[:2]
+            frame_h, frame_w = frame.shape[:2]
 
-            # inference on full-res
+            # --- INFERENCE ON FULL-RES FRAME ---
             results = model(frame, imgsz=args.imgsz, conf=args.conf, verbose=False)
 
-            # build annotated display frame
+            # downscale for display
             display_frame = cv2.resize(frame, (view_w, view_h))
-            scale_x = view_w / frame_w_px
-            scale_y = view_h / frame_h_px
+            scale_x = view_w / frame_w
+            scale_y = view_h / frame_h
 
-            display_frame, det_count, guidance = annotate_frame(
-                display_frame, results,
-                frame_w=frame_w_px, frame_h=frame_h_px,
-                conf_thresh=args.conf,
-                scale_x=scale_x, scale_y=scale_y,
-                refine=args.refine, raw_frame=frame,
-                deadzone=args.deadzone,
-                display_fps=display_fps[0]
-            )
+            # --- DRAW FRAME CENTER CROSSHAIR ---
+            smid_x = view_w // 2
+            smid_y = view_h // 2
+            cv2.line(display_frame, (smid_x - 25, smid_y), (smid_x + 25, smid_y),
+                     (200, 200, 200), 1)
+            cv2.line(display_frame, (smid_x, smid_y - 25), (smid_x, smid_y + 25),
+                     (200, 200, 200), 1)
+            cv2.circle(display_frame, (smid_x, smid_y), 6, (200, 200, 200), 1)
 
-            # encode to JPEG for streaming
-            _, buf = cv2.imencode('.jpg', display_frame,
-                                  [cv2.IMWRITE_JPEG_QUALITY, 80])
-            with lock:
-                latest_jpeg[0] = buf.tobytes()
+            # --- PROCESS DETECTIONS ---
+            best_box = None
+            best_conf = 0.0
+            best_result = None
+            det_count = 0
 
-            # terminal guidance
-            if guidance is not None:
-                cx, cy, dx, dy, direction_str, centered = guidance
-                if centered:
-                    print(f"\r[** CENTERED **] "
-                          f"X@({cx},{cy}) offset=({dx:+d},{dy:+d}) "
-                          f"FPS={display_fps[0]:.1f}       ", end="", flush=True)
+            for result in results:
+                for box in result.boxes:
+                    conf = float(box.conf[0])
+                    if conf < args.conf:
+                        continue
+                    det_count += 1
+                    if conf > best_conf:
+                        best_conf = conf
+                        best_box = box
+                        best_result = result
+
+                    # draw bounding box
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    cls_name = result.names[int(box.cls[0])]
+                    dx1 = int(x1 * scale_x)
+                    dy1 = int(y1 * scale_y)
+                    dx2 = int(x2 * scale_x)
+                    dy2 = int(y2 * scale_y)
+
+                    cv2.rectangle(display_frame, (dx1, dy1), (dx2, dy2),
+                                  (0, 255, 0), 2)
+                    label = f"{cls_name} {conf:.2f}"
+                    lsz, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(display_frame, (dx1, dy1 - lsz[1] - 10),
+                                  (dx1 + lsz[0], dy1), (0, 255, 0), -1)
+                    cv2.putText(display_frame, label, (dx1, dy1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+            # --- GUIDANCE FOR BEST DETECTION ---
+            if best_box is not None:
+                # find X center
+                if args.refine:
+                    cx, cy = find_x_center_refined(frame, best_box)
                 else:
-                    print(f"\r[MOVE] {direction_str}  "
+                    cx, cy = find_x_center_bbox(best_box)
+
+                direction_str, dx, dy, centered = compute_guidance(
+                    cx, cy, frame_w, frame_h, args.deadzone
+                )
+
+                # draw X center dot
+                dcx = int(cx * scale_x)
+                dcy = int(cy * scale_y)
+                color = (0, 255, 0) if centered else (0, 0, 255)
+                cv2.circle(display_frame, (dcx, dcy), 8, color, -1)
+                cv2.circle(display_frame, (dcx, dcy), 10, (255, 255, 255), 2)
+
+                # line from X center to frame center
+                cv2.line(display_frame, (dcx, dcy), (smid_x, smid_y), color, 2)
+
+                # guidance text on screen
+                if centered:
+                    guide_text = "*** CENTERED ***"
+                    guide_color = (0, 255, 0)
+                else:
+                    guide_text = direction_str
+                    guide_color = (0, 165, 255)
+
+                cv2.putText(display_frame, guide_text,
+                            (10, view_h - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, guide_color, 2)
+
+                # offset readout
+                offset_text = f"offset: ({dx:+d}, {dy:+d})px"
+                cv2.putText(display_frame, offset_text,
+                            (10, view_h - 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                # terminal output
+                cls_name = best_result.names[int(best_box.cls[0])]
+                if centered:
+                    print(f"\r[** CENTERED **] {cls_name} conf={best_conf:.2f} "
+                          f"X@({cx},{cy}) offset=({dx:+d},{dy:+d}) "
+                          f"FPS={display_fps:.1f}       ", end="", flush=True)
+                else:
+                    print(f"\r[MOVE] {direction_str} | "
+                          f"{cls_name} conf={best_conf:.2f} "
                           f"X@({cx},{cy}) ({dx:+d},{dy:+d}) "
-                          f"FPS={display_fps[0]:.1f}       ", end="", flush=True)
+                          f"FPS={display_fps:.1f}       ", end="", flush=True)
             else:
-                print(f"\rSearching... FPS: {display_fps[0]:.1f} "
-                      f"| No X detected          ", end="", flush=True)
+                print(f"\rSearching... FPS: {display_fps:.1f} | No X   ",
+                      end="", flush=True)
 
-            # FPS
-            fps_count[0] += 1
-            elapsed = time.time() - fps_start[0]
+            # --- FPS ---
+            fps_count += 1
+            elapsed = time.time() - fps_start
             if elapsed >= 1.0:
-                display_fps[0] = fps_count[0] / elapsed
-                fps_count[0] = 0
-                fps_start[0] = time.time()
+                display_fps = fps_count / elapsed
+                fps_count = 0
+                fps_start = time.time()
 
-        cap.release()
+            info = f"FPS: {display_fps:.1f} | X: {det_count} | {method_tag}"
+            cv2.putText(display_frame, info, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    # start capture in background thread
-    t = threading.Thread(target=capture_loop, daemon=True)
-    t.start()
+            cv2.imshow(window_name, display_frame)
 
-    # Flask app
-    app = Flask(__name__)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), 27):
+                break
+            elif key == ord('s'):
+                fname = f"x_guide_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                cv2.imwrite(fname, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                print(f"\n[+] Saved full-res: {fname}")
 
-    @app.route('/')
-    def index():
-        return """
-        <html>
-        <head>
-            <title>X Detector - Live</title>
-            <style>
-                body {
-                    background: #111; margin: 0; padding: 0;
-                    display: flex; justify-content: center; align-items: center;
-                    min-height: 100vh; font-family: monospace;
-                }
-                img {
-                    max-width: 100%; height: auto;
-                    border: 2px solid #333;
-                }
-            </style>
-        </head>
-        <body>
-            <img src="/video_feed" />
-        </body>
-        </html>
-        """
-
-    def generate():
-        while running[0]:
-            with lock:
-                frame_bytes = latest_jpeg[0]
-            if frame_bytes is None:
-                time.sleep(0.05)
-                continue
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n'
-                   + frame_bytes + b'\r\n')
-            time.sleep(0.03)  # ~30 fps max to browser
-
-    @app.route('/video_feed')
-    def video_feed():
-        return Response(generate(),
-                        mimetype='multipart/x-mixed-replace; boundary=frame')
-
-    try:
-        # suppress Flask request logs to keep terminal clean for guidance
-        import logging
-        log = logging.getLogger('werkzeug')
-        log.setLevel(logging.ERROR)
-
-        app.run(host='0.0.0.0', port=args.port, threaded=True)
-    except KeyboardInterrupt:
-        pass
     finally:
-        running[0] = False
-        print("\n[*] Stopped.")
+        print()
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 # ---------------------------------------------------------------------------
-# Headless mode (terminal only, no video)
+# Headless mode (terminal only)
 # ---------------------------------------------------------------------------
 def run_headless(args):
     print("[*] Loading X detection model...")
@@ -474,7 +375,6 @@ def run_headless(args):
     fps_count = 0
     fps_start = time.time()
     display_fps = 0
-    debug_saved = False
 
     method_tag = "REFINED" if args.refine else "BBOX"
     print(f"[*] Headless (conf={args.conf}, imgsz={args.imgsz}, "
@@ -488,13 +388,6 @@ def run_headless(args):
             if not ret:
                 time.sleep(0.1)
                 continue
-
-            if args.save_debug and not debug_saved:
-                cv2.imwrite("debug_raw_frame.jpg", frame,
-                            [cv2.IMWRITE_JPEG_QUALITY, 95])
-                print(f"[DEBUG] Saved: debug_raw_frame.jpg "
-                      f"({frame.shape[1]}x{frame.shape[0]})")
-                debug_saved = True
 
             frame_h, frame_w = frame.shape[:2]
             results = model(frame, imgsz=args.imgsz, conf=args.conf, verbose=False)
@@ -520,7 +413,6 @@ def run_headless(args):
                 direction_str, dx, dy, centered = compute_guidance(
                     cx, cy, frame_w, frame_h, args.deadzone
                 )
-
                 cls_name = best_result.names[int(best_box.cls[0])]
 
                 if centered:
@@ -528,12 +420,12 @@ def run_headless(args):
                           f"X@({cx},{cy}) offset=({dx:+d},{dy:+d}) "
                           f"FPS={display_fps:.1f}       ", end="", flush=True)
                 else:
-                    print(f"\r[MOVE] {direction_str}  |  "
+                    print(f"\r[MOVE] {direction_str} | "
                           f"{cls_name} conf={best_conf:.2f} "
                           f"X@({cx},{cy}) ({dx:+d},{dy:+d}) "
                           f"FPS={display_fps:.1f}       ", end="", flush=True)
             else:
-                print(f"\rSearching... FPS: {display_fps:.1f} | No X detected   ",
+                print(f"\rSearching... FPS: {display_fps:.1f} | No X   ",
                       end="", flush=True)
 
             fps_count += 1
@@ -581,7 +473,6 @@ def run_snapshot(args):
     results = model(frame, imgsz=args.imgsz, conf=args.conf, verbose=False)
 
     annotated = frame.copy()
-
     mid_x, mid_y = frame_w // 2, frame_h // 2
     cv2.line(annotated, (mid_x - 30, mid_y), (mid_x + 30, mid_y), (200, 200, 200), 2)
     cv2.line(annotated, (mid_x, mid_y - 30), (mid_x, mid_y + 30), (200, 200, 200), 2)
@@ -593,7 +484,6 @@ def run_snapshot(args):
             if conf < args.conf:
                 continue
             det_count += 1
-
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             cls_name = result.names[int(box.cls[0])]
 
@@ -651,28 +541,19 @@ if __name__ == "__main__":
                         help="Use green-segmentation within bbox for precise "
                              "X crossing point (default: bbox midpoint)")
     parser.add_argument("--deadzone", type=int, default=50,
-                        help="Pixel deadzone for 'centered' (default: 50)")
-    parser.add_argument("--port", type=int, default=5000,
-                        help="Flask server port (default: 5000)")
+                        help="Pixel deadzone for centered (default: 50)")
 
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--stream", action="store_true",
-                       help="Video in browser + guidance in terminal")
     group.add_argument("--headless", action="store_true",
-                       help="Terminal only, no video")
+                       help="Terminal only, no video window")
     group.add_argument("--snapshot", action="store_true",
                        help="Single frame detection + save")
 
     args = parser.parse_args()
 
-    if args.stream:
-        run_stream(args)
-    elif args.headless:
+    if args.headless:
         run_headless(args)
     elif args.snapshot:
         run_snapshot(args)
     else:
-        # default to stream mode since live GTK won't work over SSH
-        print("[*] No mode specified, defaulting to --stream")
-        args.stream = True
-        run_stream(args)
+        run_live(args)
