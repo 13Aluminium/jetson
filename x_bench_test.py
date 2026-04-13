@@ -418,14 +418,12 @@ def run_bench(args):
 
     # Connect Pixhawk
     master = None
-    armed = False
     if not args.dry_run:
         master = connect_pixhawk(args.device, args.baud)
-        armed = force_arm(master)
-        if not armed:
-            print("[!] Failed to arm — motors won't spin.")
-            print("    Check: is Pixhawk powered properly via USB-C?")
-            print("    Continuing to show detection logic...")
+        # Try to arm — but DO_MOTOR_TEST works even without arming
+        # so we continue regardless (same as x_detect_motor.py)
+        force_arm(master)
+        time.sleep(0.5)
 
     # Open camera
     mode = MODES[args.mode]
@@ -437,7 +435,7 @@ def run_bench(args):
 
     if not cap.isOpened():
         print("[!] Failed to open camera.")
-        if armed and not args.dry_run:
+        if not args.dry_run and master:
             force_disarm(master)
         return
 
@@ -538,7 +536,7 @@ def run_bench(args):
                     kickstart_start_time = now
                     print(f"\n[!!!] X DETECTED — KICKSTART: {KICKSTART_THROTTLE}% "
                           f"ALL motors for {kickstart_duration}s!")
-                    if not args.dry_run and master and armed:
+                    if not args.dry_run and master:
                         send_all_motors(master, KICKSTART_THROTTLE,
                                         KICKSTART_THROTTLE, KICKSTART_THROTTLE,
                                         KICKSTART_THROTTLE, duration=kickstart_duration + 1)
@@ -556,7 +554,7 @@ def run_bench(args):
                         print(f"\n[*] Kickstart done! Switching to differential mode.")
                         print(f"    Base={args.base_throttle}% +/- {args.max_diff}%")
                         # Brief pause
-                        if not args.dry_run and master and armed:
+                        if not args.dry_run and master:
                             stop_all_motors(master)
                         time.sleep(0.3)
 
@@ -573,7 +571,7 @@ def run_bench(args):
                         )
 
                     # Send motor commands
-                    if not args.dry_run and master and armed:
+                    if not args.dry_run and master:
                         if now - last_cmd_time >= cmd_interval:
                             send_all_motors(master, m1, m2, m3, m4, duration=1.5)
                             last_cmd_time = now
@@ -582,7 +580,7 @@ def run_bench(args):
             else:
                 # No detection — stop motors after timeout
                 if motors_active and (now - last_detection_time > no_detect_timeout):
-                    if not args.dry_run and master and armed:
+                    if not args.dry_run and master:
                         stop_all_motors(master)
                         motors_active = False
                     direction_str = "NO TARGET — motors stopped"
@@ -717,7 +715,7 @@ def run_bench(args):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
                 # Status bar
-                mode_str = "DRY RUN" if args.dry_run else ("ARMED" if armed else "NOT ARMED")
+                mode_str = "DRY RUN" if args.dry_run else "PIXHAWK"
                 if in_kickstart:
                     active_str = "KICKSTART"
                 elif motors_active:
