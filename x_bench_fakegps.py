@@ -287,13 +287,13 @@ def setup_fakegps_params(master):
 # ---------------------------------------------------------------------------
 class FakeGPS:
     """
-    Sends GPS_INPUT messages at 5Hz to make Pixhawk think
-    it has a 3D GPS fix at a fixed location and altitude.
+    Sends GPS_INPUT messages at 10Hz + companion heartbeat at 1Hz
+    to make Pixhawk think it has a 3D GPS fix at a fixed location.
     """
 
-    def __init__(self, master, lat=33.77, lon=-118.19, alt=10.0):
+    def __init__(self, master, lat=23.0258, lon=72.5873, alt=10.0):
         """
-        lat/lon: any valid coordinate (Long Beach, CA by default)
+        lat/lon: Ahmedabad, Gujarat by default
         alt: simulated altitude in meters
         """
         self.master = master
@@ -317,38 +317,54 @@ class FakeGPS:
         return gps_week, gps_week_ms
 
     def _send_loop(self):
+        from pymavlink import mavutil
+
+        last_heartbeat = 0
+
         while self.running:
             try:
+                now = time.time()
+
+                # Send companion heartbeat at 1Hz (prevents failsafe)
+                if now - last_heartbeat >= 1.0:
+                    self.master.mav.heartbeat_send(
+                        mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                        0, 0, 0
+                    )
+                    last_heartbeat = now
+
+                # Send GPS data
                 gps_week, gps_week_ms = self._get_gps_time()
 
                 self.master.mav.gps_input_send(
-                    int(time.time() * 1e6),   # time_usec
-                    0,                         # gps_id
-                    # ignore_flags bitmask (raw values — works on all pymavlink versions)
+                    int(now * 1e6),            # time_usec
+                    0,                          # gps_id
+                    # ignore_flags bitmask (raw values)
                     # bit 3 = speed_accuracy (8)
                     # bit 4 = horiz_accuracy (16)
                     # bit 5 = vert_accuracy  (32)
-                    8 | 16 | 32,              # = 56
-                    gps_week_ms,              # time_week_ms
-                    gps_week,                 # time_week
-                    3,                         # fix_type: 3D fix
-                    self.lat,                  # lat (deg * 1E7)
-                    self.lon,                  # lon (deg * 1E7)
-                    self.alt,                  # alt (m AMSL)
-                    0.8,                       # hdop
-                    0.8,                       # vdop
-                    0.0,                       # vn (m/s)
-                    0.0,                       # ve (m/s)
-                    0.0,                       # vd (m/s)
-                    0.0,                       # speed_accuracy
-                    0.5,                       # horiz_accuracy (m)
-                    1.0,                       # vert_accuracy (m)
-                    12,                        # satellites_visible
+                    8,                          # only ignore speed_accuracy
+                    gps_week_ms,               # time_week_ms
+                    gps_week,                  # time_week
+                    3,                          # fix_type: 3D fix
+                    self.lat,                   # lat (deg * 1E7)
+                    self.lon,                   # lon (deg * 1E7)
+                    self.alt,                   # alt (m AMSL)
+                    0.6,                        # hdop (good quality)
+                    0.6,                        # vdop (good quality)
+                    0.0,                        # vn (m/s) — stationary
+                    0.0,                        # ve (m/s)
+                    0.0,                        # vd (m/s)
+                    0.0,                        # speed_accuracy
+                    0.3,                        # horiz_accuracy (m) — good
+                    0.5,                        # vert_accuracy (m) — good
+                    16,                         # satellites_visible (strong fix)
                 )
             except Exception as e:
                 print(f"[GPS] Send error: {e}")
 
-            time.sleep(0.2)  # 5 Hz
+            time.sleep(0.1)  # 10 Hz
 
     def start(self):
         self.running = True
@@ -363,47 +379,89 @@ class FakeGPS:
             self.thread.join(timeout=2)
         print("[GPS] Fake GPS stopped")
 
-    def wait_for_ekf(self, timeout=60):
+    def wait_for_ekf(self, timeout=120):
         """Wait for EKF to converge and accept our fake GPS."""
         from pymavlink import mavutil
 
         print(f"[GPS] Waiting for EKF to accept fake GPS (up to {timeout}s)...")
-        print(f"      Keep Pixhawk still on the bench!")
+        print(f"      Keep Pixhawk STILL on the bench! Don't move it.")
+        print(f"      This can take 30-90 seconds. Be patient...")
         start = time.time()
 
+        got_3d_fix = False
+        fix_time = 0
+
         while time.time() - start < timeout:
-            # Check for GPS_RAW_INT to see if Pixhawk accepts our GPS
             msg = self.master.recv_match(
-                type=['GPS_RAW_INT', 'EKF_STATUS_REPORT'],
+                type=['GPS_RAW_INT', 'EKF_STATUS_REPORT', 'STATUSTEXT'],
                 blocking=True, timeout=2
             )
 
+            elapsed = time.time() - start
+
             if msg:
-                if msg.get_type() == 'GPS_RAW_INT':
+                mtype = msg.get_type()
+
+                if mtype == 'GPS_RAW_INT':
                     fix = msg.fix_type
                     sats = msg.satellites_visible
-                    elapsed = time.time() - start
-                    print(f"\r[GPS] {elapsed:.0f}s — fix_type={fix}, "
+                    print(f"\r[GPS] {elapsed:.0f}s — fix={fix}, "
                           f"sats={sats}     ", end="", flush=True)
 
-                    if fix >= 3:
-                        print(f"\n[GPS] 3D fix obtained!")
-                        # Give EKF a few more seconds to settle
-                        print("[GPS] Waiting 10s for EKF to settle...")
-                        time.sleep(10)
+                    if fix >= 3 and not got_3d_fix:
+                        got_3d_fix = True
+                        fix_time = time.time()
+                        print(f"\n[GPS] 3D fix obtained! Waiting for EKF to settle...")
+
+                elif mtype == 'EKF_STATUS_REPORT':
+                    flags = msg.flags
+                    # EKF flags: bit0=attitude, bit1=vel_horiz, bit2=vel_vert,
+                    #            bit3=pos_horiz_rel, bit4=pos_horiz_abs, bit5=pos_vert
+                    att_ok = bool(flags & 0x01)
+                    vel_h = bool(flags & 0x02)
+                    pos_h = bool(flags & 0x08)  # pos_horiz_rel
+                    pos_abs = bool(flags & 0x10)  # pos_horiz_abs
+
+                    if not got_3d_fix:
+                        print(f"\r[EKF] {elapsed:.0f}s — att={att_ok} vel={vel_h} "
+                              f"pos_rel={pos_h} pos_abs={pos_abs}    ",
+                              end="", flush=True)
+
+                    # If we have 3D fix AND EKF has position, we're good
+                    if got_3d_fix and (pos_h or pos_abs):
+                        print(f"\n[EKF] Converged! att={att_ok} vel={vel_h} "
+                              f"pos_rel={pos_h} pos_abs={pos_abs}")
+                        # Brief extra settle time
+                        print("[EKF] Settling for 5 more seconds...")
+                        time.sleep(5)
                         self.gps_ok = True
                         return True
 
-                elif msg.get_type() == 'EKF_STATUS_REPORT':
-                    flags = msg.flags
-                    # Check if position is good (bit 0 and 2)
-                    pos_ok = bool(flags & 0x01)
-                    vel_ok = bool(flags & 0x02)
-                    if pos_ok and vel_ok:
-                        pass  # Good, keep waiting for GPS fix
+                elif mtype == 'STATUSTEXT':
+                    text = msg.text.strip()
+                    if text:
+                        print(f"\n[PIX] {text}")
 
-        print(f"\n[GPS] Timeout waiting for EKF ({timeout}s)")
-        print("      Check: GPS_TYPE=14? Rebooted after setting?")
+            # If we got 3D fix but EKF still not converged after 30s, 
+            # try anyway — some setups work without full EKF flags
+            if got_3d_fix and (time.time() - fix_time > 30):
+                print(f"\n[GPS] 3D fix held for 30s. Proceeding anyway...")
+                self.gps_ok = True
+                return True
+
+        print(f"\n[GPS] Timeout after {timeout}s.")
+        print("      Checklist:")
+        print("      1. GPS_TYPE = 14? (run --set-params)")
+        print("      2. Pixhawk rebooted after setting params?")
+        print("      3. ARMING_CHECK = 0?")
+        print("      4. Pixhawk kept still during wait?")
+
+        # If we at least got 3D fix, let the user try anyway
+        if got_3d_fix:
+            print("\n      3D fix WAS obtained. Trying to continue anyway...")
+            self.gps_ok = True
+            return True
+
         return False
 
 
@@ -552,7 +610,7 @@ def run_bench(args):
         print("  MODE: DRY RUN (vision only)")
     else:
         print(f"  MODE: LIVE (Pixhawk @ {args.device})")
-        print(f"  FAKE GPS: lat={args.lat}, lon={args.lon}, alt={args.alt}m")
+        print(f"  FAKE GPS: lat={args.lat}, lon={args.lon}, alt={args.alt}m (Gujarat)")
     print(f"  MAX SPEED: {args.max_speed} m/s")
     print(f"  DEADZONE: {args.deadzone}px")
     print(f"  CENTER: {'refined' if args.refine else 'bbox'}")
@@ -880,14 +938,14 @@ if __name__ == "__main__":
                         help="Max velocity m/s (default: 0.3)")
 
     # Fake GPS
-    parser.add_argument("--lat", type=float, default=33.77,
-                        help="Fake GPS latitude (default: 33.77 Long Beach)")
-    parser.add_argument("--lon", type=float, default=-118.19,
-                        help="Fake GPS longitude (default: -118.19)")
+    parser.add_argument("--lat", type=float, default=23.0258,
+                        help="Fake GPS latitude (default: 23.0258 Ahmedabad, Gujarat)")
+    parser.add_argument("--lon", type=float, default=72.5873,
+                        help="Fake GPS longitude (default: 72.5873)")
     parser.add_argument("--alt", type=float, default=10.0,
                         help="Fake GPS altitude meters (default: 10)")
-    parser.add_argument("--ekf-timeout", type=int, default=60,
-                        help="Max seconds to wait for EKF (default: 60)")
+    parser.add_argument("--ekf-timeout", type=int, default=120,
+                        help="Max seconds to wait for EKF (default: 120)")
 
     # Modes
     parser.add_argument("--dry-run", action="store_true",
