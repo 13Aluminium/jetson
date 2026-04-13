@@ -407,6 +407,7 @@ def run_bench(args):
         print(f"  MODE: LIVE (Pixhawk @ {args.device})")
     print(f"  BASE THROTTLE: {args.base_throttle}%")
     print(f"  MAX DIFFERENTIAL: +/- {args.max_diff}%")
+    print(f"  KICKSTART: {args.kickstart}s at 100% on first detection")
     print(f"  DEADZONE: {args.deadzone}px")
     print(f"  CENTER METHOD: {'refined (green seg)' if args.refine else 'bbox midpoint'}")
     print("=" * 65)
@@ -464,10 +465,20 @@ def run_bench(args):
     last_detection_time = 0
     no_detect_timeout = 2.0  # stop motors after 2s without X
 
+    # Kickstart: first time X is seen → 100% all motors for a burst
+    # This confirms the Pixhawk→ESC chain works before differential testing
+    kickstart_done = False
+    kickstart_start_time = 0
+    kickstart_duration = args.kickstart  # seconds at 100%
+    KICKSTART_THROTTLE = 100
+    in_kickstart = False
+
     method_tag = "REFINED" if args.refine else "BBOX"
     print(f"\n[*] Running bench test. Move your X target around!")
     print(f"    Press 'q' to quit, 's' for snapshot")
-    print(f"    Motors spin when X detected, stop when X lost for {no_detect_timeout}s")
+    print(f"    KICKSTART: First X detection → {KICKSTART_THROTTLE}% ALL motors for {kickstart_duration}s")
+    print(f"    After kickstart → differential throttle mode")
+    print(f"    Motors stop when X lost for {no_detect_timeout}s")
     print("-" * 65)
 
     try:
@@ -520,24 +531,53 @@ def run_bench(args):
                     cx, cy, frame_w, frame_h, args.deadzone
                 )
 
-                if centered:
-                    # All motors at base (hovering steady)
-                    m1 = m2 = m3 = m4 = args.base_throttle
-                else:
-                    # Differential throttle based on offset
-                    m1, m2, m3, m4 = offset_to_motor_throttle(
-                        dx, dy, frame_w, frame_h,
-                        base_throttle=args.base_throttle,
-                        max_diff=args.max_diff,
-                        deadzone=args.deadzone
-                    )
+                # --- KICKSTART PHASE ---
+                # First time X is detected: 100% all motors to confirm they work
+                if not kickstart_done and not in_kickstart:
+                    in_kickstart = True
+                    kickstart_start_time = now
+                    print(f"\n[!!!] X DETECTED — KICKSTART: {KICKSTART_THROTTLE}% "
+                          f"ALL motors for {kickstart_duration}s!")
+                    if not args.dry_run and master and armed:
+                        send_all_motors(master, KICKSTART_THROTTLE,
+                                        KICKSTART_THROTTLE, KICKSTART_THROTTLE,
+                                        KICKSTART_THROTTLE, duration=kickstart_duration + 1)
+                    motors_active = True
 
-                # Send motor commands
-                if not args.dry_run and master and armed:
-                    if now - last_cmd_time >= cmd_interval:
-                        send_all_motors(master, m1, m2, m3, m4, duration=1.5)
-                        last_cmd_time = now
-                        motors_active = True
+                if in_kickstart:
+                    elapsed_kick = now - kickstart_start_time
+                    remaining_kick = max(0, kickstart_duration - elapsed_kick)
+                    m1 = m2 = m3 = m4 = KICKSTART_THROTTLE
+                    direction_str = f"KICKSTART {remaining_kick:.1f}s left"
+
+                    if elapsed_kick >= kickstart_duration:
+                        in_kickstart = False
+                        kickstart_done = True
+                        print(f"\n[*] Kickstart done! Switching to differential mode.")
+                        print(f"    Base={args.base_throttle}% +/- {args.max_diff}%")
+                        # Brief pause
+                        if not args.dry_run and master and armed:
+                            stop_all_motors(master)
+                        time.sleep(0.3)
+
+                # --- DIFFERENTIAL PHASE (after kickstart) ---
+                elif kickstart_done:
+                    if centered:
+                        m1 = m2 = m3 = m4 = args.base_throttle
+                    else:
+                        m1, m2, m3, m4 = offset_to_motor_throttle(
+                            dx, dy, frame_w, frame_h,
+                            base_throttle=args.base_throttle,
+                            max_diff=args.max_diff,
+                            deadzone=args.deadzone
+                        )
+
+                    # Send motor commands
+                    if not args.dry_run and master and armed:
+                        if now - last_cmd_time >= cmd_interval:
+                            send_all_motors(master, m1, m2, m3, m4, duration=1.5)
+                            last_cmd_time = now
+                            motors_active = True
 
             else:
                 # No detection — stop motors after timeout
@@ -557,7 +597,12 @@ def run_bench(args):
             # --- Terminal output ---
             if det_count > 0:
                 motor_str = f"M[{m1:.0f},{m2:.0f},{m3:.0f},{m4:.0f}]%"
-                if centered:
+                if in_kickstart:
+                    remaining_kick = max(0, kickstart_duration - (now - kickstart_start_time))
+                    print(f"\r[KICKSTART {remaining_kick:.1f}s] "
+                          f"ALL {KICKSTART_THROTTLE}% "
+                          f"FPS={display_fps:.1f}           ", end="", flush=True)
+                elif centered:
                     print(f"\r[CENTERED] conf={best_conf:.2f} "
                           f"X@({cx},{cy}) {motor_str} "
                           f"FPS={display_fps:.1f}           ", end="", flush=True)
@@ -673,11 +718,20 @@ def run_bench(args):
 
                 # Status bar
                 mode_str = "DRY RUN" if args.dry_run else ("ARMED" if armed else "NOT ARMED")
-                active_str = "MOTORS ON" if motors_active else "STANDBY"
+                if in_kickstart:
+                    active_str = "KICKSTART"
+                elif motors_active:
+                    active_str = "DIFFERENTIAL"
+                else:
+                    active_str = "STANDBY"
                 info = (f"FPS:{display_fps:.1f} | X:{det_count} | "
                         f"{method_tag} | {mode_str} | {active_str}")
                 bar_color = (200, 200, 200) if args.dry_run else (0, 200, 255)
-                if motors_active:
+                if in_kickstart:
+                    bar_color = (0, 0, 255)
+                    cv2.rectangle(display_frame, (0, 0),
+                                  (view_w - 1, view_h - 1), (0, 0, 255), 5)
+                elif motors_active:
                     bar_color = (0, 0, 255)
                     cv2.rectangle(display_frame, (0, 0),
                                   (view_w - 1, view_h - 1), (0, 0, 255), 3)
@@ -742,6 +796,8 @@ if __name__ == "__main__":
                         help="Base motor throttle percent (default: 15)")
     parser.add_argument("--max-diff", type=int, default=10,
                         help="Max differential throttle +/- percent (default: 10)")
+    parser.add_argument("--kickstart", type=int, default=3,
+                        help="Seconds at 100%% on first X detection (default: 3)")
 
     # Modes
     parser.add_argument("--dry-run", action="store_true",
