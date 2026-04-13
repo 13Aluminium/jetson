@@ -317,8 +317,6 @@ class FakeGPS:
         return gps_week, gps_week_ms
 
     def _send_loop(self):
-        from pymavlink import mavutil
-
         while self.running:
             try:
                 gps_week, gps_week_ms = self._get_gps_time()
@@ -326,10 +324,11 @@ class FakeGPS:
                 self.master.mav.gps_input_send(
                     int(time.time() * 1e6),   # time_usec
                     0,                         # gps_id
-                    # ignore flags: ignore speed_accuracy, horiz_accuracy, vert_accuracy
-                    (mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_SPEED_ACCURACY |
-                     mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_HORIZ_ACCURACY |
-                     mavutil.mavlink.GPS_INPUT_IGNORE_FLAG_VERT_ACCURACY),
+                    # ignore_flags bitmask (raw values — works on all pymavlink versions)
+                    # bit 3 = speed_accuracy (8)
+                    # bit 4 = horiz_accuracy (16)
+                    # bit 5 = vert_accuracy  (32)
+                    8 | 16 | 32,              # = 56
                     gps_week_ms,              # time_week_ms
                     gps_week,                 # time_week
                     3,                         # fix_type: 3D fix
