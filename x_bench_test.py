@@ -1,34 +1,56 @@
 #!/usr/bin/env python3
 """
-X Landing — Phase 2 Bench Test
-================================
+X Landing — Phase 2 Bench Test (v2 — DO_MOTOR_TEST)
+=====================================================
 Fixed camera + handheld X target + Pixhawk connected (PROPS OFF!)
 
-What this tests:
-  1. YOLO detects the X
-  2. Centering offset is computed (from x_detect_guide.py logic)
-  3. Offset is converted to velocity commands
-  4. Commands are sent to Pixhawk via MAVLink (GUIDED mode)
-  5. You verify the RIGHT motors respond to the RIGHT direction
+WHY v2:
+  The v1 script used GUIDED mode + SET_POSITION_TARGET_LOCAL_NED.
+  That requires GPS lock + EKF + pre-arm checks → fails on the bench.
+  
+  This version uses DO_MOTOR_TEST (proven working on your setup)
+  and maps the X offset to DIFFERENTIAL motor throttle so you can
+  verify the correct motors respond to the correct direction.
+
+How it works:
+  - Detects X, computes offset from frame center
+  - Converts offset to motor throttle per motor (1-4)
+  - Motors on the "correction side" spin faster
+  - Example: X is LEFT of center → drone needs to go LEFT
+    → motors on right side spin faster to tilt left
+  
+  MOTOR LAYOUT (ArduCopter default X-frame, looking from top):
+  
+       Front
+    1 (CW)   2 (CCW)
+        \\ /
+         X
+        / \\
+    4 (CCW)  3 (CW)
+       Back
+  
+  To move LEFT  → tilt left  → right motors (2,3) spin faster
+  To move RIGHT → tilt right → left motors (1,4) spin faster
+  To move FWD   → tilt fwd   → back motors (3,4) spin faster
+  To move BACK  → tilt back  → front motors (1,2) spin faster
+
+  *** YOUR FRAME MAY BE DIFFERENT ***
+  Run the test, see which motors spin, flip the mapping if wrong.
+  That's the whole point of Phase 2!
 
 Setup:
-  - Mount camera pointing down (or at an angle — doesn't matter for bench)
-  - Connect Pixhawk via USB (/dev/ttyACM0)
-  - REMOVE ALL PROPS
-  - Hold your hardboard X target in front of the camera
-  - Move it around and watch which motors respond
-
-Modes:
-  --dry-run       : detection + offset calc only, no Pixhawk (Phase 1 test)
-  --log           : save all offsets + commands to CSV for review
-  (default)       : full Phase 2 — sends commands to Pixhawk
+  1. Mount camera pointing down at table/floor
+  2. Connect Pixhawk via USB-C (/dev/ttyACM0)
+  3. REMOVE ALL PROPS!!!
+  4. Hold hardboard X target, move it around
+  5. Watch which motors respond — verify direction is correct
 
 Usage:
-    python3 x_bench_test.py --dry-run              # Phase 1: logic only
-    python3 x_bench_test.py                        # Phase 2: Pixhawk connected
-    python3 x_bench_test.py --log                  # Phase 2 + CSV logging
-    python3 x_bench_test.py --throttle 15          # gentler motor test
-    python3 x_bench_test.py --headless             # SSH, no display
+    python3 x_bench_test.py --dry-run            # logic only, no Pixhawk
+    python3 x_bench_test.py                      # live motor test
+    python3 x_bench_test.py --log                # + save CSV
+    python3 x_bench_test.py --base-throttle 10   # gentler (default 15%)
+    python3 x_bench_test.py --headless           # SSH, no display window
 
 REMOVE PROPS FOR TESTING!
 
@@ -140,19 +162,13 @@ def find_x_center_refined(frame, box):
 
 
 # ---------------------------------------------------------------------------
-# Compute offset and direction
+# Compute offset
 # ---------------------------------------------------------------------------
 def compute_offset(cx, cy, frame_w, frame_h, deadzone=50):
-    """
-    Returns (dx, dy, centered, direction_str)
-    dx > 0 means X is RIGHT of center  → drone should move RIGHT
-    dy > 0 means X is BELOW center     → drone should move FORWARD
-    (assuming camera points straight down, forward = +Y in camera)
-    """
     mid_x = frame_w // 2
     mid_y = frame_h // 2
-    dx = cx - mid_x
-    dy = cy - mid_y
+    dx = cx - mid_x  # positive = X is RIGHT of center
+    dy = cy - mid_y  # positive = X is BELOW center
 
     if abs(dx) <= deadzone and abs(dy) <= deadzone:
         return dx, dy, True, "CENTERED"
@@ -164,59 +180,84 @@ def compute_offset(cx, cy, frame_w, frame_h, deadzone=50):
         parts.append(f"RIGHT ({abs(dx)}px)")
 
     if dy < -deadzone:
-        parts.append(f"UP ({abs(dy)}px)")
+        parts.append(f"FWD ({abs(dy)}px)")
     elif dy > deadzone:
-        parts.append(f"DOWN ({abs(dy)}px)")
+        parts.append(f"BACK ({abs(dy)}px)")
 
     return dx, dy, False, " + ".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Convert pixel offset to velocity command
+# Convert offset to per-motor throttle
 # ---------------------------------------------------------------------------
-def pixel_offset_to_velocity(dx, dy, frame_w, frame_h, max_speed=0.5, deadzone=50):
+def offset_to_motor_throttle(dx, dy, frame_w, frame_h,
+                              base_throttle=15, max_diff=10, deadzone=50):
     """
-    Convert pixel offset to NED velocity (m/s).
+    Convert pixel offset to throttle for motors 1-4.
 
-    Camera-to-NED mapping (camera pointing straight down):
-      Camera +X (right)  → NED +East  (vy)
-      Camera +Y (down)   → NED +North (vx)  [forward in body frame]
+    ArduCopter X-frame (default, top view):
 
-    NOTE: This mapping depends on how your camera is mounted.
-    If motors respond in wrong direction during bench test,
-    flip the signs here. That's the whole point of Phase 2!
+         Front
+      M1(CW)    M2(CCW)
+          \\      /
+            X
+          /      \\
+      M4(CCW)   M3(CW)
+         Back
 
-    Speed is proportional to offset, capped at max_speed.
-    Inside deadzone → zero velocity.
+    To move in a direction, the OPPOSITE side motors spin faster:
+      Move LEFT  → right side (M2, M3) spin more
+      Move RIGHT → left side  (M1, M4) spin more
+      Move FWD   → back side  (M3, M4) spin more
+      Move BACK  → front side (M1, M2) spin more
+
+    Returns: (m1, m2, m3, m4) throttle percentages
+    
+    *** IF MOTORS RESPOND WRONG, FLIP SIGNS BELOW ***
     """
-    # normalize offset to [-1, 1]
+    # Normalize to [-1, 1]
     norm_x = dx / (frame_w / 2)
     norm_y = dy / (frame_h / 2)
 
-    # apply deadzone
-    dz_norm_x = deadzone / (frame_w / 2)
-    dz_norm_y = deadzone / (frame_h / 2)
+    # Apply deadzone
+    dz_x = deadzone / (frame_w / 2)
+    dz_y = deadzone / (frame_h / 2)
+    if abs(norm_x) < dz_x:
+        norm_x = 0.0
+    if abs(norm_y) < dz_y:
+        norm_y = 0.0
 
-    if abs(norm_x) < dz_norm_x:
-        norm_x = 0
-    if abs(norm_y) < dz_norm_y:
-        norm_y = 0
-
-    # clamp to [-1, 1]
+    # Clamp
     norm_x = max(-1.0, min(1.0, norm_x))
     norm_y = max(-1.0, min(1.0, norm_y))
 
-    # --- CAMERA TO NED MAPPING ---
-    # Edit these if bench test shows wrong motor direction!
-    vx = norm_y * max_speed   # camera Y → NED north (forward)
-    vy = norm_x * max_speed   # camera X → NED east  (right)
-    vz = 0.0                  # no vertical for bench test
+    # Differential throttle
+    roll_diff = norm_x * max_diff    # positive = X is right → need to go right
+    pitch_diff = norm_y * max_diff   # positive = X is below → need to go back
 
-    return vx, vy, vz
+    # === MOTOR MIXING (edit here if wrong direction!) ===
+    # Each motor gets: base + roll_contribution + pitch_contribution
+    #
+    # To go RIGHT: left motors (M1, M4) spin faster → +roll_diff on M1,M4
+    # To go BACK:  front motors (M1, M2) spin faster → +pitch_diff on M1,M2
+
+    m1 = base_throttle + roll_diff + pitch_diff   # front-left
+    m2 = base_throttle - roll_diff + pitch_diff   # front-right
+    m3 = base_throttle - roll_diff - pitch_diff   # back-right
+    m4 = base_throttle + roll_diff - pitch_diff   # back-left
+
+    # Clamp to [0, base_throttle + max_diff]
+    max_t = base_throttle + max_diff
+    m1 = max(0, min(max_t, m1))
+    m2 = max(0, min(max_t, m2))
+    m3 = max(0, min(max_t, m3))
+    m4 = max(0, min(max_t, m4))
+
+    return m1, m2, m3, m4
 
 
 # ---------------------------------------------------------------------------
-# Pixhawk connection
+# Pixhawk connection + motor commands (from your working x_detect_motor.py)
 # ---------------------------------------------------------------------------
 def connect_pixhawk(device, baud):
     from pymavlink import mavutil
@@ -230,11 +271,11 @@ def connect_pixhawk(device, baud):
     return master
 
 
-def wait_cmd_ack(master, command_id, timeout=5):
+def wait_cmd_ack(master, command_id, timeout=3):
     start = time.time()
     while time.time() - start < timeout:
         try:
-            msg = master.recv_match(type="COMMAND_ACK", blocking=True, timeout=1)
+            msg = master.recv_match(type="COMMAND_ACK", blocking=True, timeout=0.5)
             if msg and msg.command == command_id:
                 return msg
         except Exception:
@@ -242,26 +283,8 @@ def wait_cmd_ack(master, command_id, timeout=5):
     return None
 
 
-def set_guided_mode(master):
-    """Switch to GUIDED mode (mode number 4 for copter)."""
-    from pymavlink import mavutil
-
-    print("[MAV] Setting GUIDED mode...")
-    master.mav.set_mode_send(
-        master.target_system,
-        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        4  # GUIDED mode for ArduCopter
-    )
-    time.sleep(1)
-    # verify
-    master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
-        0, 0, 0, 0, 0, 0, 0, 0)
-    print("[MAV] GUIDED mode set")
-
-
 def force_arm(master):
+    """Force arm using 21196 — same as your working x_detect_motor.py."""
     from pymavlink import mavutil
 
     print("[MAV] >>> FORCE ARMING <<<")
@@ -295,55 +318,40 @@ def force_disarm(master):
         print(f"[MAV] Disarm result: {ack.result if ack else 'no response'}")
 
 
-def send_velocity_ned(master, vx, vy, vz):
+def send_motor_test(master, motor_num, throttle_pct, duration=1.0):
     """
-    Send velocity command in NED frame.
-    vx = north (forward), vy = east (right), vz = down (positive = descend)
+    Send DO_MOTOR_TEST — same method as your working x_detect_motor.py.
+    motor_num: 1-4
+    throttle_pct: 0-100
+    duration: seconds (use short duration, we resend each loop)
     """
     from pymavlink import mavutil
 
-    # type_mask: ignore position, acceleration, yaw — only velocity
-    type_mask = (
-        0b0000_1111_11_000_111  # bits: pos=ignore, vel=use, accel=ignore, yaw=ignore
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_DO_MOTOR_TEST,
+        0,
+        motor_num,       # motor instance (1-4)
+        0,               # throttle type: 0 = percent
+        throttle_pct,    # throttle value
+        duration,        # timeout in seconds
+        1,               # motor count
+        0, 0
     )
-    # More readable: ignore everything except vx, vy, vz
-    type_mask = 0b0000_1100_11_000_111  # = 0x0C07... let me be explicit:
-    # bit 0: ignore px        = 1
-    # bit 1: ignore py        = 1
-    # bit 2: ignore pz        = 1
-    # bit 3: ignore vx        = 0  (USE)
-    # bit 4: ignore vy        = 0  (USE)
-    # bit 5: ignore vz        = 0  (USE)
-    # bit 6: ignore afx       = 1
-    # bit 7: ignore afy       = 1
-    # bit 8: ignore afz       = 1
-    # bit 9: ignore yaw       = 1
-    # bit 10: ignore yaw_rate = 1
-    type_mask = 0b0000_11_111_000_111  # = 0x07C7
-    # Let me just compute it properly:
-    type_mask = (
-        (1 << 0) |  # ignore px
-        (1 << 1) |  # ignore py
-        (1 << 2) |  # ignore pz
-        # bit 3,4,5 = 0 → USE vx, vy, vz
-        (1 << 6) |  # ignore afx
-        (1 << 7) |  # ignore afy
-        (1 << 8) |  # ignore afz
-        (1 << 9) |  # ignore yaw
-        (1 << 10)   # ignore yaw_rate
-    )  # = 0x07C7 = 1991
 
-    master.mav.set_position_target_local_ned_send(
-        0,                                          # time_boot_ms (ignored)
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-        type_mask,
-        0, 0, 0,           # position (ignored)
-        vx, vy, vz,        # velocity m/s
-        0, 0, 0,           # acceleration (ignored)
-        0, 0               # yaw, yaw_rate (ignored)
-    )
+
+def send_all_motors(master, m1, m2, m3, m4, duration=1.5):
+    """Send throttle to all 4 motors. Duration slightly > loop interval."""
+    send_motor_test(master, 1, m1, duration)
+    send_motor_test(master, 2, m2, duration)
+    send_motor_test(master, 3, m3, duration)
+    send_motor_test(master, 4, m4, duration)
+
+
+def stop_all_motors(master):
+    """Send zero throttle to all motors."""
+    for m in [1, 2, 3, 4]:
+        send_motor_test(master, m, 0, 0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -363,20 +371,20 @@ class BenchLogger:
                 'x_detected', 'conf',
                 'cx', 'cy',
                 'dx_px', 'dy_px', 'centered',
-                'vx_ned', 'vy_ned', 'vz_ned',
+                'm1_throttle', 'm2_throttle', 'm3_throttle', 'm4_throttle',
                 'direction', 'fps'
             ])
             print(f"[LOG] Logging to: {fname}")
 
     def log(self, frame_num, detected, conf, cx, cy,
-            dx, dy, centered, vx, vy, vz, direction, fps):
+            dx, dy, centered, m1, m2, m3, m4, direction, fps):
         if not self.enabled:
             return
         self.writer.writerow([
             datetime.now().isoformat(), frame_num,
             detected, f"{conf:.3f}",
             cx, cy, dx, dy, centered,
-            f"{vx:.4f}", f"{vy:.4f}", f"{vz:.4f}",
+            f"{m1:.1f}", f"{m2:.1f}", f"{m3:.1f}", f"{m4:.1f}",
             direction, f"{fps:.1f}"
         ])
         self.file.flush()
@@ -391,13 +399,14 @@ class BenchLogger:
 # ---------------------------------------------------------------------------
 def run_bench(args):
     print("=" * 65)
-    print("  X LANDING — PHASE 2 BENCH TEST")
+    print("  X LANDING — PHASE 2 BENCH TEST (DO_MOTOR_TEST)")
     print("=" * 65)
     if args.dry_run:
         print("  MODE: DRY RUN (no Pixhawk, logic only)")
     else:
         print(f"  MODE: LIVE (Pixhawk @ {args.device})")
-        print(f"  THROTTLE CAP: max_speed = {args.max_speed} m/s")
+    print(f"  BASE THROTTLE: {args.base_throttle}%")
+    print(f"  MAX DIFFERENTIAL: +/- {args.max_diff}%")
     print(f"  DEADZONE: {args.deadzone}px")
     print(f"  CENTER METHOD: {'refined (green seg)' if args.refine else 'bbox midpoint'}")
     print("=" * 65)
@@ -410,12 +419,12 @@ def run_bench(args):
     master = None
     armed = False
     if not args.dry_run:
-        from pymavlink import mavutil
         master = connect_pixhawk(args.device, args.baud)
-        set_guided_mode(master)
         armed = force_arm(master)
         if not armed:
-            print("[!] Failed to arm. Continuing anyway for bench test...")
+            print("[!] Failed to arm — motors won't spin.")
+            print("    Check: is Pixhawk powered properly via USB-C?")
+            print("    Continuing to show detection logic...")
 
     # Open camera
     mode = MODES[args.mode]
@@ -448,16 +457,17 @@ def run_bench(args):
     display_fps = 0.0
     frame_num = 0
     last_cmd_time = 0
-    cmd_interval = 0.1  # send commands at 10 Hz max
+    cmd_interval = 0.5  # send motor commands every 0.5s
 
-    # Safety: timeout with no detection → disarm
-    last_detection_time = time.time()
-    no_detect_timeout = 5.0  # seconds
+    # Track if motors are currently spinning
+    motors_active = False
+    last_detection_time = 0
+    no_detect_timeout = 2.0  # stop motors after 2s without X
 
     method_tag = "REFINED" if args.refine else "BBOX"
     print(f"\n[*] Running bench test. Move your X target around!")
     print(f"    Press 'q' to quit, 's' for snapshot")
-    print(f"    If no X for {no_detect_timeout}s → velocity zeroed")
+    print(f"    Motors spin when X detected, stop when X lost for {no_detect_timeout}s")
     print("-" * 65)
 
     try:
@@ -491,12 +501,12 @@ def run_bench(args):
                         best_box = box
                         best_result = result
 
-            # --- Compute offset + velocity ---
+            # --- Compute offset + motor throttle ---
             cx, cy = 0, 0
             dx, dy = 0, 0
             centered = False
             direction_str = "NO TARGET"
-            vx, vy, vz = 0.0, 0.0, 0.0
+            m1, m2, m3, m4 = 0, 0, 0, 0
 
             if best_box is not None:
                 last_detection_time = now
@@ -510,42 +520,50 @@ def run_bench(args):
                     cx, cy, frame_w, frame_h, args.deadzone
                 )
 
-                if not centered:
-                    vx, vy, vz = pixel_offset_to_velocity(
+                if centered:
+                    # All motors at base (hovering steady)
+                    m1 = m2 = m3 = m4 = args.base_throttle
+                else:
+                    # Differential throttle based on offset
+                    m1, m2, m3, m4 = offset_to_motor_throttle(
                         dx, dy, frame_w, frame_h,
-                        max_speed=args.max_speed,
+                        base_throttle=args.base_throttle,
+                        max_diff=args.max_diff,
                         deadzone=args.deadzone
                     )
-                # else: velocity stays zero = hold position
+
+                # Send motor commands
+                if not args.dry_run and master and armed:
+                    if now - last_cmd_time >= cmd_interval:
+                        send_all_motors(master, m1, m2, m3, m4, duration=1.5)
+                        last_cmd_time = now
+                        motors_active = True
 
             else:
-                # No detection
-                if now - last_detection_time > no_detect_timeout:
-                    direction_str = "NO TARGET (timeout)"
-
-            # --- Send velocity command to Pixhawk ---
-            if not args.dry_run and master and (now - last_cmd_time >= cmd_interval):
-                send_velocity_ned(master, vx, vy, vz)
-                last_cmd_time = now
+                # No detection — stop motors after timeout
+                if motors_active and (now - last_detection_time > no_detect_timeout):
+                    if not args.dry_run and master and armed:
+                        stop_all_motors(master)
+                        motors_active = False
+                    direction_str = "NO TARGET — motors stopped"
 
             # --- Log ---
             logger.log(
                 frame_num, det_count > 0, best_conf,
                 cx, cy, dx, dy, centered,
-                vx, vy, vz, direction_str, display_fps
+                m1, m2, m3, m4, direction_str, display_fps
             )
 
             # --- Terminal output ---
             if det_count > 0:
+                motor_str = f"M[{m1:.0f},{m2:.0f},{m3:.0f},{m4:.0f}]%"
                 if centered:
                     print(f"\r[CENTERED] conf={best_conf:.2f} "
-                          f"X@({cx},{cy}) offset=({dx:+d},{dy:+d}) "
-                          f"vel=(0,0,0) "
+                          f"X@({cx},{cy}) {motor_str} "
                           f"FPS={display_fps:.1f}           ", end="", flush=True)
                 else:
                     print(f"\r[{direction_str}] conf={best_conf:.2f} "
-                          f"X@({cx},{cy}) offset=({dx:+d},{dy:+d}) "
-                          f"vel=({vx:+.2f},{vy:+.2f},{vz:+.2f}) "
+                          f"{motor_str} "
                           f"FPS={display_fps:.1f}    ", end="", flush=True)
             else:
                 print(f"\rSearching... FPS={display_fps:.1f} | No X    ",
@@ -584,8 +602,8 @@ def run_bench(args):
                 # Draw all detections
                 for result in results:
                     for box in result.boxes:
-                        conf = float(box.conf[0])
-                        if conf < args.conf:
+                        conf_val = float(box.conf[0])
+                        if conf_val < args.conf:
                             continue
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         cls_name = result.names[int(box.cls[0])]
@@ -595,7 +613,7 @@ def run_bench(args):
                         dy2 = int(y2 * scale_y)
                         cv2.rectangle(display_frame, (dx1, dy1), (dx2, dy2),
                                       (0, 255, 0), 2)
-                        label = f"{cls_name} {conf:.2f}"
+                        label = f"{cls_name} {conf_val:.2f}"
                         lsz, _ = cv2.getTextSize(label,
                                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                         cv2.rectangle(display_frame, (dx1, dy1 - lsz[1] - 10),
@@ -613,19 +631,29 @@ def run_bench(args):
                     cv2.line(display_frame, (dcx, dcy),
                              (smid_x, smid_y), dot_color, 2)
 
-                    # Velocity vector visualization (scaled up for visibility)
-                    arrow_scale = 200
-                    arrow_end_x = smid_x + int(vy * arrow_scale)  # vy = east = right
-                    arrow_end_y = smid_y + int(vx * arrow_scale)  # vx = north = up... 
-                    # but on screen, down is +Y, so north (forward) = up on screen
-                    arrow_end_y = smid_y - int(vx * arrow_scale)
-                    cv2.arrowedLine(display_frame, (smid_x, smid_y),
-                                    (arrow_end_x, arrow_end_y),
-                                    (0, 255, 255), 3, tipLength=0.3)
+                # Motor throttle bars (bottom-right corner)
+                bar_x = view_w - 180
+                bar_y = view_h - 130
+                motor_vals = [m1, m2, m3, m4]
+                motor_labels = ["M1(FL)", "M2(FR)", "M3(BR)", "M4(BL)"]
+                max_t = args.base_throttle + args.max_diff
+                for i, (val, lbl) in enumerate(zip(motor_vals, motor_labels)):
+                    y_pos = bar_y + i * 28
+                    bar_len = int((val / max(max_t, 1)) * 120)
+                    color = (0, 200, 255) if val > 0 else (80, 80, 80)
+                    cv2.rectangle(display_frame,
+                                  (bar_x, y_pos), (bar_x + bar_len, y_pos + 20),
+                                  color, -1)
+                    cv2.rectangle(display_frame,
+                                  (bar_x, y_pos), (bar_x + 120, y_pos + 20),
+                                  (150, 150, 150), 1)
+                    cv2.putText(display_frame, f"{lbl}:{val:.0f}%",
+                                (bar_x - 95, y_pos + 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
                 # Guidance text
                 if centered:
-                    guide_text = "*** CENTERED — HOLD ***"
+                    guide_text = "*** CENTERED — ALL EQUAL ***"
                     guide_color = (0, 255, 0)
                 elif det_count > 0:
                     guide_text = direction_str
@@ -637,24 +665,24 @@ def run_bench(args):
                 cv2.putText(display_frame, guide_text, (10, view_h - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, guide_color, 2)
 
-                # Velocity readout
-                vel_text = f"vel NED: ({vx:+.2f}, {vy:+.2f}, {vz:+.2f}) m/s"
-                cv2.putText(display_frame, vel_text, (10, view_h - 45),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
                 # Offset readout
                 if det_count > 0:
                     off_text = f"offset: ({dx:+d}, {dy:+d})px"
-                    cv2.putText(display_frame, off_text, (10, view_h - 75),
+                    cv2.putText(display_frame, off_text, (10, view_h - 45),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
                 # Status bar
-                mode_str = "DRY RUN" if args.dry_run else "PIXHAWK LIVE"
+                mode_str = "DRY RUN" if args.dry_run else ("ARMED" if armed else "NOT ARMED")
+                active_str = "MOTORS ON" if motors_active else "STANDBY"
                 info = (f"FPS:{display_fps:.1f} | X:{det_count} | "
-                        f"{method_tag} | {mode_str}")
+                        f"{method_tag} | {mode_str} | {active_str}")
                 bar_color = (200, 200, 200) if args.dry_run else (0, 200, 255)
+                if motors_active:
+                    bar_color = (0, 0, 255)
+                    cv2.rectangle(display_frame, (0, 0),
+                                  (view_w - 1, view_h - 1), (0, 0, 255), 3)
                 cv2.putText(display_frame, info, (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, bar_color, 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, bar_color, 2)
 
                 cv2.imshow(window_name, display_frame)
 
@@ -670,10 +698,10 @@ def run_bench(args):
         print("\n[*] Stopped by user.")
 
     finally:
-        # Safety: always zero velocity and disarm
+        # Safety: always stop motors and disarm
         if not args.dry_run and master:
-            print("\n[*] Zeroing velocity...")
-            send_velocity_ned(master, 0, 0, 0)
+            print("\n[*] Stopping motors...")
+            stop_all_motors(master)
             time.sleep(0.5)
             force_disarm(master)
 
@@ -710,8 +738,10 @@ if __name__ == "__main__":
                         help="Pixhawk serial port (default: /dev/ttyACM0)")
     parser.add_argument("--baud", type=int, default=115200,
                         help="Baud rate (default: 115200)")
-    parser.add_argument("--max-speed", type=float, default=0.3,
-                        help="Max velocity m/s for bench test (default: 0.3)")
+    parser.add_argument("--base-throttle", type=int, default=15,
+                        help="Base motor throttle percent (default: 15)")
+    parser.add_argument("--max-diff", type=int, default=10,
+                        help="Max differential throttle +/- percent (default: 10)")
 
     # Modes
     parser.add_argument("--dry-run", action="store_true",
@@ -725,7 +755,7 @@ if __name__ == "__main__":
 
     if not args.dry_run:
         print("\n" + "!" * 65)
-        print("  WARNING: This script sends commands to Pixhawk!")
+        print("  WARNING: This script SPINS MOTORS using DO_MOTOR_TEST!")
         print("  REMOVE ALL PROPS before continuing.")
         print("!" * 65)
         resp = input("\n  Props removed? (y/n): ").strip().lower()
