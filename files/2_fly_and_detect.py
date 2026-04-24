@@ -23,6 +23,15 @@ def main(args):
     print("[*] Loading YOLO model...")
     model = load_yolo(args.weights)
 
+    # Warmup: run one inference so first real frame isn't slow
+    import numpy as np
+    print("[*] YOLO warmup inference...")
+    _warm_t = time.time()
+    _dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+    _ = model(_dummy, imgsz=args.imgsz, conf=args.conf, verbose=False)
+    print(f"[*] Warmup done in {time.time()-_warm_t:.2f}s "
+          f"(device: {next(model.model.parameters()).device})")
+
     fc = FlightController()
     if not args.dry_run:
         fc.connect()
@@ -59,7 +68,9 @@ def main(args):
             if not ret: time.sleep(0.05); continue
             frames += 1
 
+            inf_t0 = time.time()
             det = detect_x(frame, model, args.conf, args.imgsz)
+            inf_ms = (time.time() - inf_t0) * 1000
             elapsed = time.time() - t0
             remain = args.hover_time - elapsed
 
@@ -68,12 +79,14 @@ def main(args):
                 if found % 10 == 1:
                     log(None, "")  # newline
                     log(log_f, f"X conf={det['conf']:.2f} @({det['cx']},{det['cy']}) "
-                               f"bbox={det['bbox']} alt={fc.alt:.1f}m")
+                               f"bbox={det['bbox']} alt={fc.alt:.1f}m inf={inf_ms:.0f}ms")
                 print(f"\r  [{elapsed:5.1f}s] ✓ X conf={det['conf']:.2f} "
-                      f"@({det['cx']},{det['cy']}) FPS={fps:.1f} {remain:.0f}s left   ",
+                      f"@({det['cx']},{det['cy']}) FPS={fps:.1f} "
+                      f"inf={inf_ms:.0f}ms {remain:.0f}s left   ",
                       end="", flush=True)
             else:
-                print(f"\r  [{elapsed:5.1f}s] ✗ No X | FPS={fps:.1f} | {remain:.0f}s left   ",
+                print(f"\r  [{elapsed:5.1f}s] ✗ No X | FPS={fps:.1f} | "
+                      f"inf={inf_ms:.0f}ms | {remain:.0f}s left   ",
                       end="", flush=True)
 
             fps_c += 1
