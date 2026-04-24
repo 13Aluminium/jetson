@@ -444,6 +444,12 @@ def open_camera(sitl=False):
     # Run prechecks (free stale locks, restart daemon, verify device)
     camera_precheck(sitl=False)
 
+    # Pipeline notes:
+    #   - sensor-mode=1 = 1920x1080 (native, no scaling overhead)
+    #   - nvvidconv does NV12→BGRx in hardware (GPU/VIC)
+    #   - videoconvert does BGRx→BGR in software (CPU) — this is the bottleneck
+    #   - drop=true + max-buffers=1 ensures we always get the latest frame,
+    #     never a stale queued one (critical for landing guidance)
     pipeline = (
         "nvarguscamerasrc sensor-mode=1 ! "
         "video/x-raw(memory:NVMM), width=1920, height=1080, "
@@ -451,19 +457,18 @@ def open_camera(sitl=False):
         "nvvidconv flip-method=0 ! "
         "video/x-raw, width=1920, height=1080, format=BGRx ! "
         "videoconvert ! video/x-raw, format=BGR ! "
-        "appsink max-buffers=2 drop=true"
+        "appsink max-buffers=1 drop=true sync=false"
     )
     print(f"[CAM] Opening IMX477 1920x1080...")
     cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
     if not cap.isOpened():
         print("[!] Camera failed on first attempt — restarting daemon and retrying...")
-        # Full daemon restart on failure
         _run("sudo systemctl stop nvargus-daemon 2>/dev/null")
         _run("sudo killall -9 nvargus-daemon 2>/dev/null")
         time.sleep(2)
         free_camera()
         _ensure_nvargus()
-        time.sleep(3)  # extra settle time after full restart
+        time.sleep(3)
         cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         if not cap.isOpened():
             print("[!] Camera failed again! Check hardware:")
@@ -472,10 +477,35 @@ def open_camera(sitl=False):
             print("    3. ls /dev/video*")
             print("    4. sudo systemctl restart nvargus-daemon && sleep 5")
             return None
+
     # Flush initial dark/garbage frames
     for _ in range(15): cap.read()
-    print("[CAM] Ready.")
+
+    # ── Measure ACTUAL FPS ──
+    # CAP_PROP_FPS lies (returns pipeline requested rate, not real throughput).
+    # Measure over ~2 seconds to get the true number.
+    print("[CAM] Measuring actual FPS...")
+    fps_frames = 0
+    fps_t0 = time.time()
+    while time.time() - fps_t0 < 2.0:
+        ret, _ = cap.read()
+        if ret: fps_frames += 1
+    measured_fps = fps_frames / (time.time() - fps_t0)
+
+    # Store on the capture object so scripts can read it
+    cap._measured_fps = round(measured_fps, 1)
+    print(f"[CAM] Ready. Actual throughput: {cap._measured_fps} FPS")
     return cap
+
+
+def get_camera_fps(cap, sitl=False):
+    """Get the real FPS for a camera. Use this for VideoWriter."""
+    if hasattr(cap, '_measured_fps') and cap._measured_fps > 1:
+        return cap._measured_fps
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps and fps > 1:
+        return fps
+    return 30 if sitl else 21  # safe fallback
 
 
 # ===========================================================================
