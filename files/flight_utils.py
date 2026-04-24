@@ -451,10 +451,12 @@ def open_camera(sitl=False):
 # ===========================================================================
 _yolo_model = None
 
-def load_yolo(weights=DEFAULT_WEIGHTS):
+def load_yolo(weights=DEFAULT_WEIGHTS, imgsz=DEFAULT_IMGSZ):
     global _yolo_model
     if _yolo_model: return _yolo_model
     from ultralytics import YOLO
+    import numpy as np
+
     for p in [weights, os.path.expanduser(f"~/{weights}")]:
         if os.path.exists(p): weights = p; break
     else:
@@ -462,6 +464,29 @@ def load_yolo(weights=DEFAULT_WEIGHTS):
     print(f"[YOLO] Loading {weights}...")
     _yolo_model = YOLO(weights)
     print(f"[YOLO] Classes: {_yolo_model.names}")
+
+    # ── Device check ──
+    try:
+        device = next(_yolo_model.model.parameters()).device
+        print(f"[YOLO] Device: {device}")
+        if str(device) == "cpu":
+            print("[YOLO] ⚠ Running on CPU — inference will be SLOW (2-3s/frame)")
+            print("[YOLO]   Check: python3 -c \"import torch; print(torch.cuda.is_available())\"")
+    except Exception:
+        print("[YOLO] Device: unknown")
+
+    # ── Warmup inference ──
+    # First YOLO call is always slow (CUDA kernel compilation, memory alloc).
+    # Do it here so it doesn't eat into flight time.
+    print("[YOLO] Warmup inference...")
+    t0 = time.time()
+    _dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+    _ = _yolo_model(_dummy, imgsz=imgsz, conf=0.5, verbose=False)
+    warmup_ms = (time.time() - t0) * 1000
+    print(f"[YOLO] Warmup done: {warmup_ms:.0f}ms")
+    if warmup_ms > 1000:
+        print(f"[YOLO] ⚠ Inference is slow ({warmup_ms:.0f}ms) — likely on CPU!")
+
     return _yolo_model
 
 def detect_x(frame, model=None, conf=DEFAULT_CONF, imgsz=DEFAULT_IMGSZ):
