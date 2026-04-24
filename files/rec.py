@@ -19,7 +19,7 @@ import time
 from datetime import datetime
 
 import cv2
-from flight_utils import open_camera
+from flight_utils import open_camera, get_camera_fps
 
 
 running = True
@@ -43,9 +43,7 @@ def main(args):
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps <= 1:
-        fps = 21 if not args.sitl else 30
+    fps = get_camera_fps(cap, sitl=args.sitl)
 
     output = args.output or f"record_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
     writer = cv2.VideoWriter(
