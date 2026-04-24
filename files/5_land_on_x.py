@@ -44,7 +44,7 @@ def main(args):
                        f"Takeoff {args.alt}m → Find X → Center → Descend → LAND ON X"):
             return
 
-    model = load_yolo(args.weights)
+    model = load_yolo(args.weights, imgsz=args.imgsz)
 
     fc = FlightController()
     if not args.dry_run:
