@@ -51,7 +51,7 @@ TAKEOFF_ALT = 5.0  # meters
 # Camera
 FRAME_W = 1920
 FRAME_H = 1080
-HFOV_DEG = 73.0
+HFOV_DEG = 73.0  # IMX477 full-sensor (4K/sensor-mode=0) horizontal FOV
 _measured_cam_fps = None  # set by open_camera() after measuring
 
 # YOLO
@@ -446,21 +446,22 @@ def open_camera(sitl=False):
     camera_precheck(sitl=False)
 
     # Pipeline notes:
-    #   - sensor-mode=1 = 1920x1080 (native, no scaling overhead)
-    #   - nvvidconv does NV12→BGRx in hardware (GPU/VIC)
+    #   - sensor-mode=0 = 4K (3840x2160) — uses the FULL sensor area = widest FOV
+    #   - sensor-mode=1 = 1080p native — CROPS the sensor = narrower FOV!
+    #   - nvvidconv downscales 4K→1920x1080 in hardware (GPU/VIC), nearly free
     #   - videoconvert does BGRx→BGR in software (CPU) — this is the bottleneck
     #   - drop=true + max-buffers=1 ensures we always get the latest frame,
     #     never a stale queued one (critical for landing guidance)
     pipeline = (
-        "nvarguscamerasrc sensor-mode=1 ! "
-        "video/x-raw(memory:NVMM), width=1920, height=1080, "
+        "nvarguscamerasrc sensor-mode=0 ! "
+        "video/x-raw(memory:NVMM), width=3840, height=2160, "
         "framerate=30/1, format=NV12 ! "
         "nvvidconv flip-method=0 ! "
         "video/x-raw, width=1920, height=1080, format=BGRx ! "
         "videoconvert ! video/x-raw, format=BGR ! "
         "appsink max-buffers=1 drop=true sync=false"
     )
-    print(f"[CAM] Opening IMX477 1920x1080...")
+    print(f"[CAM] Opening IMX477 4K→1920x1080 (full FOV)...")
     cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
     if not cap.isOpened():
         print("[!] Camera failed on first attempt — restarting daemon and retrying...")
