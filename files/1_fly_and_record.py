@@ -39,8 +39,14 @@ def main(args):
     if cap:
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
-        vw = cv2.VideoWriter(video_fname, cv2.VideoWriter_fourcc(*'mp4v'), 30, (w,h))
-        print(f"[VID] Recording → {video_fname}")
+        # Measure actual camera FPS instead of assuming 30
+        cam_fps = cap.get(cv2.CAP_PROP_FPS)
+        if not cam_fps or cam_fps <= 1:
+            cam_fps = 21 if not args.sitl else 30   # IMX477 real-world ~21fps
+        rec_fps = args.fps or cam_fps
+        vw = cv2.VideoWriter(video_fname, cv2.VideoWriter_fourcc(*'mp4v'),
+                             rec_fps, (w,h))
+        print(f"[VID] Recording → {video_fname} ({rec_fps:.0f} FPS)")
 
     with SafeFlight(fc, camera=cap, video_writer=vw) as sf:
 
@@ -81,7 +87,10 @@ def main(args):
                   end="", flush=True)
             time.sleep(0.01)
 
-        print(f"\n\n[*] Hover done. {frames} frames recorded.")
+        total_time = time.time() - start
+        actual_fps = frames / total_time if total_time > 0 else 0
+        print(f"\n\n[*] Hover done. {frames} frames in {total_time:.1f}s "
+              f"(actual: {actual_fps:.1f} FPS)")
 
         # RTL
         fc.set_rtl()
@@ -101,6 +110,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--alt", type=float, default=TAKEOFF_ALT)
     p.add_argument("--hover-time", type=int, default=15)
+    p.add_argument("--fps", type=float, default=None,
+                   help="Video FPS (default: auto-detect, usually ~21 for IMX477)")
     p.add_argument("--dry-run", action="store_true", help="Camera only, no flight")
     p.add_argument("--sitl", action="store_true", help="SITL mode (webcam or no cam)")
     main(p.parse_args())
