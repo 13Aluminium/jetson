@@ -15,7 +15,7 @@ Terminal 2 (this script):
 import argparse, time, cv2
 from datetime import datetime
 from flight_utils import (FlightController, SafeFlight, open_camera,
-                          TAKEOFF_ALT, confirm)
+                          get_camera_fps, TAKEOFF_ALT, confirm)
 
 def main(args):
     if not args.dry_run and not args.sitl:
@@ -39,14 +39,11 @@ def main(args):
     if cap:
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
-        # Measure actual camera FPS instead of assuming 30
-        cam_fps = cap.get(cv2.CAP_PROP_FPS)
-        if not cam_fps or cam_fps <= 1:
-            cam_fps = 21 if not args.sitl else 30   # IMX477 real-world ~21fps
-        rec_fps = args.fps or cam_fps
+        # Use measured FPS (not the lying CAP_PROP_FPS)
+        rec_fps = args.fps or get_camera_fps(cap, sitl=args.sitl)
         vw = cv2.VideoWriter(video_fname, cv2.VideoWriter_fourcc(*'mp4v'),
                              rec_fps, (w,h))
-        print(f"[VID] Recording → {video_fname} ({rec_fps:.0f} FPS)")
+        print(f"[VID] Recording → {video_fname} ({rec_fps:.1f} FPS)")
 
     with SafeFlight(fc, camera=cap, video_writer=vw) as sf:
 
