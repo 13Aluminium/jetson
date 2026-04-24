@@ -21,16 +21,7 @@ def main(args):
             return
 
     print("[*] Loading YOLO model...")
-    model = load_yolo(args.weights)
-
-    # Warmup: run one inference so first real frame isn't slow
-    import numpy as np
-    print("[*] YOLO warmup inference...")
-    _warm_t = time.time()
-    _dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-    _ = model(_dummy, imgsz=args.imgsz, conf=args.conf, verbose=False)
-    print(f"[*] Warmup done in {time.time()-_warm_t:.2f}s "
-          f"(device: {next(model.model.parameters()).device})")
+    model = load_yolo(args.weights, imgsz=args.imgsz)
 
     fc = FlightController()
     if not args.dry_run:
