@@ -28,6 +28,7 @@ import sys
 import time
 import signal
 import math
+import subprocess
 import cv2
 from datetime import datetime
 from pymavlink import mavutil
@@ -310,6 +311,98 @@ class FlightController:
 # ===========================================================================
 # CAMERA
 # ===========================================================================
+def _run(cmd, check=False):
+    """Run a shell command, return (returncode, stdout). Swallow errors."""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True,
+                           text=True, timeout=10)
+        return r.returncode, r.stdout.strip()
+    except Exception:
+        return -1, ""
+
+def free_camera():
+    """Kill anything holding /dev/video* and restart nvargus-daemon."""
+    print("[PRE] Freeing camera resources...")
+
+    # 1) Find and kill processes locking /dev/video*
+    rc, out = _run("fuser /dev/video0 2>/dev/null")
+    if rc == 0 and out:
+        pids = out.split()
+        my_pid = str(os.getpid())
+        stale = [p for p in pids if p != my_pid]
+        if stale:
+            print(f"[PRE]   /dev/video0 locked by PIDs: {' '.join(stale)}")
+            for pid in stale:
+                # Identify the process before killing
+                _, pname = _run(f"ps -p {pid} -o comm= 2>/dev/null")
+                print(f"[PRE]   Killing PID {pid} ({pname or 'unknown'})...")
+                _run(f"kill -9 {pid}")
+            time.sleep(1)
+            print("[PRE]   Stale processes cleared.")
+        else:
+            print("[PRE]   /dev/video0 held by us only — OK.")
+    else:
+        print("[PRE]   /dev/video0 is free.")
+
+    # 2) Kill any leftover nvarguscamerasrc / gst-launch processes
+    for proc in ["nvarguscamerasrc", "gst-launch"]:
+        _run(f"pkill -9 -f {proc} 2>/dev/null")
+
+    # 3) Restart nvargus-daemon (handles CSI cameras on Jetson)
+    print("[PRE]   Restarting nvargus-daemon...")
+    _run("sudo systemctl restart nvargus-daemon 2>/dev/null")
+    # Fallback if systemctl isn't managing it
+    _run("sudo killall nvargus-daemon 2>/dev/null")
+    time.sleep(1)
+    _run("sudo nvargus-daemon &")
+    time.sleep(2)
+    print("[PRE]   nvargus-daemon restarted.")
+
+def camera_precheck(sitl=False):
+    """
+    Run all camera prechecks. Returns True if camera should be available.
+    Call this before open_camera() for better diagnostics.
+    """
+    if sitl:
+        return True
+
+    print("\n" + "-" * 55)
+    print("  CAMERA PRE-CHECKS")
+    print("-" * 55)
+    ok = True
+
+    # Check /dev/video0 exists
+    if os.path.exists("/dev/video0"):
+        print("  [OK]   /dev/video0 exists")
+    else:
+        print("  [FAIL] /dev/video0 not found!")
+        print("         Check ribbon cable, run: sudo media-ctl -p")
+        ok = False
+
+    # Check nvargus-daemon is running
+    rc, _ = _run("pgrep -x nvargus-daemon")
+    if rc == 0:
+        print("  [OK]   nvargus-daemon running")
+    else:
+        print("  [WARN] nvargus-daemon not running — will start it")
+
+    # Check GStreamer available
+    rc, _ = _run("gst-inspect-1.0 nvarguscamerasrc 2>/dev/null")
+    if rc == 0:
+        print("  [OK]   GStreamer nvarguscamerasrc plugin found")
+    else:
+        print("  [WARN] nvarguscamerasrc plugin not found")
+        ok = False
+
+    # Free stale locks
+    free_camera()
+
+    print("-" * 55)
+    print(f"  {'CAMERA READY ✓' if ok else 'CAMERA ISSUES ✗ — will try anyway'}")
+    print("-" * 55 + "\n")
+    return ok
+
+
 def open_camera(sitl=False):
     if sitl:
         print("[CAM] SITL mode — trying webcam...")
@@ -319,6 +412,10 @@ def open_camera(sitl=False):
             return cap
         print("[CAM] No webcam — camera features disabled in SITL.")
         return None
+
+    # Run prechecks (free stale locks, restart daemon, verify device)
+    camera_precheck(sitl=False)
+
     pipeline = (
         "nvarguscamerasrc sensor-mode=1 ! "
         "video/x-raw(memory:NVMM), width=1920, height=1080, "
@@ -331,8 +428,19 @@ def open_camera(sitl=False):
     print(f"[CAM] Opening IMX477 1920x1080...")
     cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
     if not cap.isOpened():
-        print("[!] Camera failed! Check /dev/video0 or restart nvargus-daemon")
-        return None
+        print("[!] Camera failed on first attempt — retrying in 3s...")
+        time.sleep(3)
+        free_camera()
+        time.sleep(2)
+        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        if not cap.isOpened():
+            print("[!] Camera failed again! Check hardware:")
+            print("    1. Ribbon cable seated properly?")
+            print("    2. sudo media-ctl -p")
+            print("    3. ls /dev/video*")
+            print("    4. sudo systemctl restart nvargus-daemon")
+            return None
+    # Flush initial dark/garbage frames
     for _ in range(15): cap.read()
     print("[CAM] Ready.")
     return cap
