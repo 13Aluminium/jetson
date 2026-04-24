@@ -52,6 +52,7 @@ TAKEOFF_ALT = 5.0  # meters
 FRAME_W = 1920
 FRAME_H = 1080
 HFOV_DEG = 73.0
+_measured_cam_fps = None  # set by open_camera() after measuring
 
 # YOLO
 DEFAULT_WEIGHTS = "best_22.pt"
@@ -484,6 +485,7 @@ def open_camera(sitl=False):
     # ── Measure ACTUAL FPS ──
     # CAP_PROP_FPS lies (returns pipeline requested rate, not real throughput).
     # Measure over ~2 seconds to get the true number.
+    global _measured_cam_fps
     print("[CAM] Measuring actual FPS...")
     fps_frames = 0
     fps_t0 = time.time()
@@ -491,20 +493,20 @@ def open_camera(sitl=False):
         ret, _ = cap.read()
         if ret: fps_frames += 1
     measured_fps = fps_frames / (time.time() - fps_t0)
-
-    # Store on the capture object so scripts can read it
-    cap._measured_fps = round(measured_fps, 1)
-    print(f"[CAM] Ready. Actual throughput: {cap._measured_fps} FPS")
+    _measured_cam_fps = round(measured_fps, 1)
+    print(f"[CAM] Ready. Actual throughput: {_measured_cam_fps} FPS")
     return cap
 
 
-def get_camera_fps(cap, sitl=False):
+def get_camera_fps(cap=None, sitl=False):
     """Get the real FPS for a camera. Use this for VideoWriter."""
-    if hasattr(cap, '_measured_fps') and cap._measured_fps > 1:
-        return cap._measured_fps
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps and fps > 1:
-        return fps
+    global _measured_cam_fps
+    if _measured_cam_fps and _measured_cam_fps > 1:
+        return _measured_cam_fps
+    if cap:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps and fps > 1:
+            return fps
     return 30 if sitl else 21  # safe fallback
 
 
