@@ -52,6 +52,7 @@ TAKEOFF_ALT = 5.0  # meters
 FRAME_W = 1920
 FRAME_H = 1080
 HFOV_DEG = 73.0  # IMX477 full-sensor (4K/sensor-mode=0) horizontal FOV
+CAM_OFFSET_FWD = 0.38  # meters — camera is 0.38m FORWARD of drone center
 _measured_cam_fps = None  # set by open_camera() after measuring
 
 # YOLO
@@ -573,12 +574,21 @@ def detect_x(frame, model=None, conf=DEFAULT_CONF, imgsz=DEFAULT_IMGSZ):
 # PIXEL → METERS
 # ===========================================================================
 def pixels_to_meters(dx_px, dy_px, alt_m):
-    """Camera down. Image top = drone forward. Returns (fwd_m, right_m)."""
+    """
+    Camera down. Image top = drone forward. Returns (fwd_m, right_m).
+
+    Compensates for camera offset: the camera is mounted CAM_OFFSET_FWD
+    (0.38m) forward of the drone's center. When the camera sees the X
+    dead center, the drone's center is 0.38m behind the X — so we add
+    that offset to the forward component.
+    """
     hfov = math.radians(HFOV_DEG)
     vfov = hfov * (FRAME_H / FRAME_W)
     gw = 2 * alt_m * math.tan(hfov/2)
     gh = 2 * alt_m * math.tan(vfov/2)
-    return -dy_px * (gh/FRAME_H), dx_px * (gw/FRAME_W)
+    fwd_m   = -dy_px * (gh / FRAME_H) + CAM_OFFSET_FWD
+    right_m =  dx_px * (gw / FRAME_W)
+    return fwd_m, right_m
 
 
 # ===========================================================================
