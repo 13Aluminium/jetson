@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-Script 5: LAND ON X — The Mother Script (with Video Recording)
+Script 5: LAND ON X — with LIVE BROWSER FEED
 ================================================================
 Takeoff → Search for X → Center over X → Descend in steps → Land on X
-Records the camera feed the entire time with detection overlay.
+Records the camera feed AND streams it live to your browser.
 
-State machine:
-    TAKEOFF → SEARCH → ACQUIRE → DESCEND → FINAL → LAND
+Usage:
+    python3 5_land_on_x_live.py --alt 5
+    python3 5_land_on_x_live.py --alt 5 --feed-port 5000
+    python3 5_land_on_x_live.py --dry-run       # ground test, no flight
+    python3 5_land_on_x_live.py --sitl
 
-Terminal 1: mavproxy.py --master=/dev/ttyACM0 --baudrate=115200 --out=udp:127.0.0.1:14551
-Terminal 2: python3 5_land_on_x.py
+Then open on your MacBook:
+    http://<JETSON_IP>:5000
 
-SITL test (no real camera — uses webcam or skips detection):
-    Terminal 1: sim_vehicle.py -v ArduCopter --console --map --out=udp:127.0.0.1:14551
-    Terminal 2: python3 5_land_on_x.py --sitl
+Terminal 1: mavproxy.py --master=/dev/ttyACM0 --baudrate=115200 \\
+            --out=udp:127.0.0.1:14551
+Terminal 2: python3 5_land_on_x_live.py --alt 5
 
 Failsafes:
     Ctrl+C → RTL | Exception → RTL | X lost 10s → RTL | Search timeout 60s → RTL
 """
-import argparse, time, math, os, cv2
+import argparse, time, math, os, cv2, threading
 from datetime import datetime
+from flask import Flask, Response, render_template_string
 from flight_utils import (FlightController, SafeFlight, open_camera,
                           load_yolo, detect_x, pixels_to_meters,
                           get_camera_fps,
@@ -47,37 +51,138 @@ OVERLAY_COLOR_OK = (0, 255, 0)       # green — X detected
 OVERLAY_COLOR_LOST = (0, 0, 255)     # red — X lost
 OVERLAY_COLOR_CENTER = (0, 255, 255) # yellow — crosshair
 
+# ── Live Feed globals ─────────────────────────────────────────
+FEED_QUALITY = 60  # JPEG quality for browser stream
+latest_frame = None
+frame_lock = threading.Lock()
+flask_app = Flask(__name__)
+
+
+# ══════════════════════════════════════════════════════════════
+# LIVE FEED (Flask)
+# ══════════════════════════════════════════════════════════════
+
+FEED_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Land on X — Live</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #111; color: #eee;
+            font-family: -apple-system, system-ui, sans-serif;
+            display: flex; flex-direction: column;
+            align-items: center; min-height: 100vh;
+        }
+        h1 { margin: 15px 0 5px; font-size: 1.3em; color: #0f0; font-weight: 500; }
+        .info { font-size: 0.8em; color: #666; margin-bottom: 10px; }
+        .info span { color: #0f0; }
+        img {
+            max-width: 95vw; max-height: 84vh;
+            border: 2px solid #333; border-radius: 6px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎯 Land on X — Live Feed</h1>
+    <p class="info">Status: <span>STREAMING</span> | Detection overlay active</p>
+    <img src="/video_feed" alt="Live Feed">
+</body>
+</html>
+"""
+
+
+def update_feed_frame(overlay_frame):
+    """Called from the main loop to push the latest overlay frame to the feed."""
+    global latest_frame
+    # Resize for streaming (keep full FOV, just shrink for bandwidth)
+    small = cv2.resize(overlay_frame, (960, 540), interpolation=cv2.INTER_NEAREST)
+    ret, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, FEED_QUALITY])
+    if ret:
+        with frame_lock:
+            latest_frame = buf.tobytes()
+
+
+def generate_frames():
+    """Yield MJPEG frames for the browser."""
+    while True:
+        with frame_lock:
+            frame_bytes = latest_frame
+        if frame_bytes is None:
+            time.sleep(0.05)
+            continue
+        yield (
+            b'--frame\r\n'
+            b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n'
+        )
+        time.sleep(0.03)  # ~30 fps cap to avoid hammering
+
+
+@flask_app.route('/')
+def index():
+    return render_template_string(FEED_HTML)
+
+
+@flask_app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+def start_feed_server(port):
+    """Start Flask in a daemon thread — won't block the main flight loop."""
+    import subprocess
+    try:
+        ip = subprocess.check_output("hostname -I", shell=True).decode().strip().split()[0]
+    except Exception:
+        ip = "localhost"
+
+    print(f"\n{'='*55}")
+    print(f"  📡 LIVE FEED on http://{ip}:{port}")
+    print(f"  Open this on your MacBook to watch!")
+    print(f"{'='*55}\n")
+
+    t = threading.Thread(
+        target=lambda: flask_app.run(host='0.0.0.0', port=port, threaded=True,
+                                      use_reloader=False),
+        daemon=True
+    )
+    t.start()
+    return t
+
+
+# ══════════════════════════════════════════════════════════════
+# OVERLAY
+# ══════════════════════════════════════════════════════════════
 
 def draw_overlay(frame, state, det, cur_alt, fc, centered=False):
     """Draw detection overlay, crosshair, and HUD onto the frame."""
     h, w = frame.shape[:2]
     cx, cy = w // 2, h // 2
 
-    # ── Crosshair at frame center ─────────────────────────────
+    # ── Crosshair at frame center
     size = 30
     cv2.line(frame, (cx - size, cy), (cx + size, cy), OVERLAY_COLOR_CENTER, 1)
     cv2.line(frame, (cx, cy - size), (cx, cy + size), OVERLAY_COLOR_CENTER, 1)
 
-    # ── Adaptive deadzone circle ──────────────────────────────
+    # ── Adaptive deadzone circle
     dz = DEADZONE_LOW if cur_alt < FINAL_ALT + 1 else DEADZONE_HIGH
     cv2.circle(frame, (cx, cy), dz, OVERLAY_COLOR_CENTER, 1)
 
-    # ── Detection bbox + line to center ───────────────────────
+    # ── Detection bbox + line to center
     if det:
         x1, y1, x2, y2 = det['bbox']
         color = OVERLAY_COLOR_OK
         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
 
-        # Line from frame center to detection center
         dcx, dcy = int(det['cx']), int(det['cy'])
         cv2.line(frame, (cx, cy), (dcx, dcy), color, 1)
 
-        # Detection label
         label = f"X {det['conf']:.0%}"
         cv2.putText(frame, label, (int(x1), int(y1) - 8),
                     OVERLAY_FONT, 0.6, color, 2)
 
-        # Pixel offset
         dx_px = det['cx'] - cx
         dy_px = det['cy'] - cy
         cv2.putText(frame, f"dx={dx_px:+.0f} dy={dy_px:+.0f}px",
@@ -86,7 +191,7 @@ def draw_overlay(frame, state, det, cur_alt, fc, centered=False):
         cv2.putText(frame, "NO X", (cx - 30, cy + 50),
                     OVERLAY_FONT, 0.8, OVERLAY_COLOR_LOST, 2)
 
-    # ── HUD: state / altitude / GPS / battery ─────────────────
+    # ── HUD
     hud_color = OVERLAY_COLOR_OK if det else OVERLAY_COLOR_LOST
     lines = [
         f"STATE: {state}",
@@ -101,13 +206,11 @@ def draw_overlay(frame, state, det, cur_alt, fc, centered=False):
 
     y_off = 25
     for i, line in enumerate(lines):
-        # Black shadow for readability
         cv2.putText(frame, line, (11, y_off + i * 24),
                     OVERLAY_FONT, 0.55, (0, 0, 0), 3)
         cv2.putText(frame, line, (10, y_off + i * 24),
                     OVERLAY_FONT, 0.55, hud_color, 1)
 
-    # Timestamp bottom-right
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     cv2.putText(frame, ts, (w - 160, h - 12),
                 OVERLAY_FONT, 0.5, (255, 255, 255), 1)
@@ -115,12 +218,35 @@ def draw_overlay(frame, state, det, cur_alt, fc, centered=False):
     return frame
 
 
+# ══════════════════════════════════════════════════════════════
+# HELPER: draw overlay + write video + push to live feed
+# ══════════════════════════════════════════════════════════════
+
+def process_frame(frame, state, det, cur_alt, fc, vw, centered=False):
+    """Draw overlay, write to video, push to live feed. Returns frame count delta."""
+    if frame is None:
+        return 0
+    overlay = draw_overlay(frame.copy(), state, det, cur_alt, fc, centered)
+    if vw:
+        vw.write(overlay)
+    update_feed_frame(overlay)
+    return 1
+
+
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
+
 def main(args):
     if not args.dry_run and not args.sitl:
-        if not confirm("5_land_on_x.py — MOTHER SCRIPT",
+        if not confirm("5_land_on_x_live.py — MOTHER SCRIPT + LIVE FEED",
                        f"Takeoff {args.alt}m → Find X → Center → Descend → LAND ON X\n"
-                       f"  Video recording: ON"):
+                       f"  Video recording: ON\n"
+                       f"  Live feed: http://0.0.0.0:{args.feed_port}"):
             return
+
+    # ── Start live feed server ─────────────────────────────────
+    start_feed_server(args.feed_port)
 
     model = load_yolo(args.weights, imgsz=args.imgsz)
 
@@ -136,14 +262,14 @@ def main(args):
     # ── Video writer setup ────────────────────────────────────
     vw = None
     video_path = None
-    actual_fps = 20.0  # fallback
+    video_path_tmp = None
+    actual_fps = 20.0
     frame_count = 0
     record_t0 = None
 
     if cap:
         actual_fps = get_camera_fps(cap)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Record to temp file first — remux with correct FPS after
         video_path_tmp = f"landing_{ts}_tmp.mp4"
         video_path = f"landing_{ts}.mp4"
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -156,7 +282,7 @@ def main(args):
             print(f"[REC] Recording → {video_path}  ({actual_fps:.1f} FPS)")
 
     log_fname, log_f = create_log("landing")
-    log(log_f, "AUTONOMOUS X LANDING (with video)")
+    log(log_f, "AUTONOMOUS X LANDING (with video + live feed)")
     log(log_f, f"Alt={args.alt}m | Step={DESCEND_STEP}m | Final={FINAL_ALT}m | Land={LAND_ALT}m")
     if video_path:
         log(log_f, f"Video: {video_path}")
@@ -164,9 +290,9 @@ def main(args):
     with SafeFlight(fc, camera=cap, video_writer=vw) as sf:
 
         state = "TAKEOFF"
-        last_x = 0          # last time X was seen
-        search_t0 = 0       # when search started
-        descend_tgt = 0     # target alt for current descent
+        last_x = 0
+        search_t0 = 0
+        descend_tgt = 0
 
         if args.dry_run:
             state = "SEARCH"
@@ -190,9 +316,6 @@ def main(args):
             # ── TAKEOFF ──────────────────────────────────────
             if state == "TAKEOFF":
                 log(log_f, f"TAKEOFF → {args.alt}m")
-
-                # Start recording during takeoff — write frames in the
-                # settle loop below so we capture from the start
                 record_t0 = time.time()
 
                 if not fc.set_guided(): state = "ABORT"; continue
@@ -203,7 +326,7 @@ def main(args):
                     fc.set_rtl(); state = "ABORT"; continue
                 log(log_f, "At altitude — stabilizing 3s")
 
-                # Settle — keep recording frames
+                # Settle — keep recording + streaming
                 t0 = time.time()
                 while time.time() - t0 < 3:
                     if cap:
@@ -211,24 +334,24 @@ def main(args):
                         if ret:
                             det = detect_x(frame, model, args.conf, args.imgsz)
                             fc.poll()
-                            overlay = draw_overlay(frame.copy(), "TAKEOFF", det,
-                                                   fc.alt, fc)
-                            if vw: vw.write(overlay); frame_count += 1
+                            frame_count += process_frame(frame, "TAKEOFF", det,
+                                                          fc.alt, fc, vw)
                     time.sleep(0.05)
 
                 state = "SEARCH"
                 search_t0 = time.time()
                 continue
 
-            # ── Write video frame (for all states after takeoff) ──
-            if frame is not None and vw:
-                centered = False  # set below in ACQUIRE if needed
+            # ── Write video frame + push to live feed ─────────
+            if frame is not None:
                 overlay = draw_overlay(frame.copy(), state, det, cur_alt, fc,
                                        centered=False)
-                vw.write(overlay)
-                frame_count += 1
-                if record_t0 is None:
-                    record_t0 = time.time()
+                if vw:
+                    vw.write(overlay)
+                    frame_count += 1
+                    if record_t0 is None:
+                        record_t0 = time.time()
+                update_feed_frame(overlay)
 
             # ── SEARCH ───────────────────────────────────────
             if state == "SEARCH":
@@ -268,7 +391,6 @@ def main(args):
                 dx_px = det['cx'] - FRAME_W // 2
                 dy_px = det['cy'] - FRAME_H // 2
 
-                # Adaptive deadzone + speed based on altitude
                 dz = DEADZONE_LOW if cur_alt < FINAL_ALT + 1 else DEADZONE_HIGH
                 spd = SPEED_LOW if cur_alt < FINAL_ALT + 1 else SPEED_HIGH
 
@@ -278,12 +400,10 @@ def main(args):
                                f"(offset: {dx_px:+d},{dy_px:+d}px)")
                     if not args.dry_run: fc.stop()
 
-                    # Re-draw this frame with centered flag for the video
-                    if frame is not None and vw:
-                        overlay = draw_overlay(frame.copy(), state, det,
-                                               cur_alt, fc, centered=True)
-                        vw.write(overlay)
-                        frame_count += 1
+                    # Re-draw this frame with centered flag
+                    if frame is not None:
+                        frame_count += process_frame(frame, state, det,
+                                                      cur_alt, fc, vw, centered=True)
 
                     if cur_alt <= LAND_ALT + 0.5:
                         state = "LAND"
@@ -324,14 +444,12 @@ def main(args):
                     if time.time() - t0 > 15: break
                     if not args.dry_run: fc.velocity_ned(0, 0, DESCENT_VZ)
 
-                    # Keep recording during descent
                     if cap:
                         ret, frm = cap.read()
                         if ret:
                             d = detect_x(frm, model, args.conf, args.imgsz)
-                            overlay = draw_overlay(frm.copy(), "DESCEND", d,
-                                                   cur_alt, fc)
-                            if vw: vw.write(overlay); frame_count += 1
+                            frame_count += process_frame(frm, "DESCEND", d,
+                                                          cur_alt, fc, vw)
 
                     print(f"\r  [DESCEND] {cur_alt:.1f}m → {descend_tgt:.1f}m   ",
                           end="", flush=True)
@@ -353,12 +471,9 @@ def main(args):
                         ret, frame = cap.read()
                         if ret: det = detect_x(frame, model, args.conf, args.imgsz)
 
-                    # Record during final approach
-                    if frame is not None and vw:
-                        overlay = draw_overlay(frame.copy(), "FINAL", det,
-                                               cur_alt, fc)
-                        vw.write(overlay)
-                        frame_count += 1
+                    if frame is not None:
+                        frame_count += process_frame(frame, "FINAL", det,
+                                                      cur_alt, fc, vw)
 
                     if cur_alt <= LAND_ALT + 0.3:
                         log(log_f, f"Below {LAND_ALT}m → LAND"); state = "LAND"; break
@@ -393,7 +508,6 @@ def main(args):
                 log(log_f, f"LAND at {cur_alt:.1f}m")
                 if not args.dry_run:
                     fc.set_land()
-                    # Keep recording while landing
                     land_t0 = time.time()
                     while fc.armed and (time.time() - land_t0 < 30):
                         fc.poll()
@@ -401,9 +515,8 @@ def main(args):
                             ret, frm = cap.read()
                             if ret:
                                 d = detect_x(frm, model, args.conf, args.imgsz)
-                                overlay = draw_overlay(frm.copy(), "LANDING",
-                                                       d, fc.alt, fc)
-                                if vw: vw.write(overlay); frame_count += 1
+                                frame_count += process_frame(frm, "LANDING", d,
+                                                              fc.alt, fc, vw)
                         time.sleep(0.1)
                 log(log_f, "LANDED ON X!")
                 print("\n\n" + "="*55)
@@ -425,7 +538,6 @@ def main(args):
         log(log_f, f"Video: {frame_count} frames, {record_elapsed:.1f}s, "
                    f"measured {measured_fps:.1f} FPS")
 
-        # Remux with correct FPS so playback is real-time
         if frame_count > 0 and os.path.isfile(video_path_tmp):
             try:
                 import subprocess
@@ -440,11 +552,9 @@ def main(args):
                 os.remove(video_path_tmp)
                 log(log_f, f"Remuxed → {video_path} @ {measured_fps:.1f} FPS")
             except Exception as e:
-                # ffmpeg not available — keep the raw file
                 os.rename(video_path_tmp, video_path)
                 log(log_f, f"ffmpeg remux failed ({e}), raw file kept: {video_path}")
         else:
-            # No frames or no temp file — clean up
             if os.path.isfile(video_path_tmp):
                 os.rename(video_path_tmp, video_path)
 
@@ -453,12 +563,15 @@ def main(args):
     if video_path:
         print(f"[*] Video: {video_path}")
 
+
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Autonomous X Landing (with video)")
+    p = argparse.ArgumentParser(description="Autonomous X Landing (with live feed)")
     p.add_argument("--alt", type=float, default=TAKEOFF_ALT)
     p.add_argument("--weights", default="best_22.pt")
     p.add_argument("--conf", type=float, default=0.50)
     p.add_argument("--imgsz", type=int, default=640)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--sitl", action="store_true")
+    p.add_argument("--feed-port", type=int, default=5000,
+                   help="Port for live browser feed (default 5000)")
     main(p.parse_args())
