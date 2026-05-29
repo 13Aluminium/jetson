@@ -653,12 +653,6 @@ def main(args):
     log(log_f, f"CSV data:          {csv_fname}")
     log(log_f, "")
 
-    # ── Close claw at startup (ensure payload is gripped) ────
-    if not args.dry_run:
-        log(log_f, "Ensuring claw is CLOSED before takeoff")
-        set_claw(fc, CLAW_CLOSE_PWM, log_f)
-        time.sleep(1.0)
-
     with SafeFlight(fc, camera=cap, video_writer=vw) as sf:
 
         # ── State variables ──────────────────────────────────
@@ -717,10 +711,10 @@ def main(args):
                 if not fc.wait_alt(args.alt):
                     fc.set_rtl(); state = "ABORT"; continue
 
-                log(log_f, f"At {fc.alt:.1f}m — stabilizing 3s")
+                log(log_f, f"At {fc.alt:.1f}m — hovering 10s for EKF yaw alignment")
 
                 t0 = time.time()
-                while time.time() - t0 < 3:
+                while time.time() - t0 < 10:
                     if cap:
                         ret, frm = cap.read()
                         if ret:
@@ -1249,3 +1243,4 @@ if __name__ == "__main__":
     p.add_argument("--feed-port", type=int, default=5000,
                    help="Port for live browser feed (default 5000)")
     main(p.parse_args())
+    
