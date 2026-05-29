@@ -107,6 +107,9 @@ LOST_TIMEOUT     = 10.0      # seconds without YOLO detection → RTL
 SEARCH_TIMEOUT   = 60.0      # seconds of searching → RTL
 VEL_RATE         = 0.2       # seconds between velocity commands
 DESCENT_VZ       = 0.30      # m/s — descent rate
+ACQUIRE_PATIENCE = 15.0      # seconds — if can't center above drop alt,
+                             # descend anyway. Precision only matters at
+                             # drop altitude, not above it.
 
 # ── Video / overlay ───────────────────────────────────────────
 OVERLAY_FONT         = cv2.FONT_HERSHEY_SIMPLEX
@@ -660,6 +663,7 @@ def main(args):
         last_x = 0
         search_t0 = 0
         descend_tgt = 0
+        acquire_t0 = 0          # when ACQUIRE started at current altitude
 
         # Rolling window for drop
         drop_window = RollingDropWindow(
@@ -762,6 +766,7 @@ def main(args):
                             frame_num=frame_count, notes="X_FOUND")
                     state = "ACQUIRE"
                     last_x = time.time()
+                    acquire_t0 = time.time()
                     continue
 
                 if elapsed > SEARCH_TIMEOUT:
@@ -869,6 +874,31 @@ def main(args):
                       f"conf={det['conf']:.2f} | "
                       f"dz={'DROP' if near_drop else 'WIDE'}   ",
                       end="", flush=True)
+
+                # ── Patience timer: can't center? descend anyway ──
+                # Above drop alt, precision doesn't matter — just get
+                # down to drop altitude where the rolling window will
+                # handle the final centering. Don't waste battery
+                # fighting wind at cruise altitude.
+                acquire_elapsed = time.time() - acquire_t0
+                if (acquire_elapsed > ACQUIRE_PATIENCE and
+                        cur_alt > drop_alt + 0.8):
+                    log(log_f, f"PATIENCE EXPIRED ({acquire_elapsed:.0f}s) — "
+                               f"X visible but not centered, descending anyway")
+                    log(log_f, f"  Current offset: ({dx_px:+d},{dy_px:+d})px "
+                               f"= {dist_m:.2f}m")
+                    csv_row(csv_f, state, fc, cur_alt, det,
+                            dx_px, dy_px, m_fwd, m_right, dist_m,
+                            frame_num=frame_count,
+                            notes=f"PATIENCE_{acquire_elapsed:.0f}s")
+                    if not args.dry_run:
+                        fc.stop()
+                    state = "DESCEND"
+                    descend_tgt = max(cur_alt - DESCEND_STEP, drop_alt)
+                    log(log_f, f"→ DESCEND to {descend_tgt:.1f}m (forced)")
+                    time.sleep(0.5)
+                    continue
+
                 time.sleep(VEL_RATE)
 
             # ── DESCEND (YOLO phase) ─────────────────────────
@@ -907,6 +937,7 @@ def main(args):
                     fc.stop()
                 log(log_f, f"At {cur_alt:.1f}m — re-acquiring")
                 time.sleep(1)
+                acquire_t0 = time.time()
                 state = "ACQUIRE"
 
             # ══════════════════════════════════════════════════
@@ -1243,4 +1274,3 @@ if __name__ == "__main__":
     p.add_argument("--feed-port", type=int, default=5000,
                    help="Port for live browser feed (default 5000)")
     main(p.parse_args())
-    
