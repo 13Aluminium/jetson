@@ -64,6 +64,7 @@ from flight_utils import (FlightController, SafeFlight, open_camera,
                           load_yolo, detect_x, pixels_to_meters,
                           get_camera_fps,
                           TAKEOFF_ALT, FRAME_W, FRAME_H,
+                          CAM_OFFSET_FWD, HFOV_DEG,
                           confirm, create_log, log)
 
 # ===========================================================================
@@ -111,9 +112,6 @@ ACQUIRE_PATIENCE = 15.0      # seconds — if can't center above drop alt,
                              # descend anyway. Precision only matters at
                              # drop altitude, not above it.
 MIN_CORRECT_DIST = 0.5       # meters — ignore corrections below this
-                             # Big drone + wind gusts make sub-0.5m
-                             # corrections pointless — they just waste
-                             # time fighting turbulence
 
 # ── Video / overlay ───────────────────────────────────────────
 OVERLAY_FONT         = cv2.FONT_HERSHEY_SIMPLEX
@@ -255,6 +253,35 @@ def median_gps(readings):
     lats = [r[0] for r in readings]
     lons = [r[1] for r in readings]
     return statistics.median(lats), statistics.median(lons)
+
+
+# ===========================================================================
+# CLAW-OFFSET CENTERING TARGET
+# ===========================================================================
+# The camera is mounted CAM_OFFSET_FWD (0.38m) FORWARD of the claw/drop
+# point. When the camera sees X at frame center, the claw is 0.38m behind.
+#
+# Fix: shift the "centered" target DOWN in the frame so that when X
+# appears at that offset position, the CLAW (not camera) is above X.
+#
+# At 3m: 0.38m ≈ 183px shift. The deadzone (80px) is checked around
+# this shifted target, not frame center.
+#
+# dx_px/dy_px for velocity commands still use frame center (pixels_to_meters
+# already adds CAM_OFFSET_FWD internally). Only the centering CHECK changes.
+
+def claw_target_cy(alt_m):
+    """
+    Compute the Y pixel where X should appear when the CLAW is above it.
+    Returns target_cy (shifted down from frame center by camera offset).
+    """
+    hfov = math.radians(HFOV_DEG)
+    vfov = hfov * (FRAME_H / FRAME_W)
+    gh = 2 * alt_m * math.tan(vfov / 2)
+    if gh <= 0:
+        return FRAME_H // 2
+    offset_px = int(CAM_OFFSET_FWD * (FRAME_H / gh))
+    return FRAME_H // 2 + offset_px
 
 
 # ===========================================================================
@@ -809,15 +836,22 @@ def main(args):
                     continue
 
                 last_x = time.time()
+                # dx/dy relative to frame center — for velocity commands
                 dx_px = det['cx'] - FRAME_W // 2
                 dy_px = det['cy'] - FRAME_H // 2
+
+                # dx/dy relative to CLAW position — for centering check
+                # Camera is 0.38m ahead of claw, so X must appear below
+                # frame center for the claw to be directly above it
+                tgt_cy = claw_target_cy(cur_alt)
+                dy_claw = det['cy'] - tgt_cy
 
                 # Use wider deadzone near drop altitude
                 near_drop = cur_alt < drop_alt + 1.5
                 dz = DEADZONE_DROP if near_drop else DEADZONE_HIGH
                 spd = SPEED_LOW if near_drop else SPEED_HIGH
 
-                if abs(dx_px) <= dz and abs(dy_px) <= dz:
+                if abs(dx_px) <= dz and abs(dy_claw) <= dz:
                     # ── CENTERED ─────────────────────────────
                     m_fwd, m_right = pixels_to_meters(dx_px, dy_px, cur_alt)
                     dist_m = math.sqrt(m_fwd**2 + m_right**2)
@@ -1009,8 +1043,11 @@ def main(args):
                 m_fwd, m_right = pixels_to_meters(dx_px, dy_px, cur_alt)
                 dist_m = math.sqrt(m_fwd**2 + m_right**2)
 
+                # Check centering against CLAW position, not camera
+                tgt_cy = claw_target_cy(cur_alt)
+                dy_claw = det['cy'] - tgt_cy
                 is_centered = (abs(dx_px) <= DEADZONE_DROP and
-                               abs(dy_px) <= DEADZONE_DROP)
+                               abs(dy_claw) <= DEADZONE_DROP)
 
                 drop_window.add_frame(is_centered, fc.lat, fc.lon,
                                        dx_px, dy_px)
@@ -1046,7 +1083,6 @@ def main(args):
                         if not args.dry_run:
                             fc.velocity_body(vx, vy, 0)
                     else:
-                        # Too small to fight wind — just hold
                         if not args.dry_run:
                             fc.stop()
 
