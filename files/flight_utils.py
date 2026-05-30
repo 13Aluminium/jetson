@@ -237,19 +237,26 @@ class FlightController:
         return False
 
     # ── Movement ──
-    def velocity_ned(self, vn, ve, vd):
-        """NED velocity. Re-send every ~1s. Vehicle stops after 3s."""
+    def velocity_ned(self, vn, ve, vd, yaw_rad=None):
+        """NED velocity with yaw hold. Re-send every ~1s. Vehicle stops after 3s."""
+        if yaw_rad is None:
+            yaw_rad = math.radians(self.heading)
         self.master.mav.set_position_target_local_ned_send(
             0, self.master.target_system, self.master.target_component,
             mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            0b0000111111000111, 0,0,0, vn,ve,vd, 0,0,0, 0,0)
+            0b0000101111000111,  # bit 10 cleared → yaw active
+            0,0,0, vn,ve,vd, 0,0,0, yaw_rad, 0)
 
-    def velocity_body(self, vx_fwd, vy_right, vz_down):
-        """Body-frame velocity. +x=forward, +y=right, +z=down."""
+    def velocity_body(self, vx_fwd, vy_right, vz_down, yaw_rad=None):
+        """Body-frame velocity with yaw hold.
+        If yaw_rad is None, locks current heading to prevent weathervaning."""
+        if yaw_rad is None:
+            yaw_rad = math.radians(self.heading)
         self.master.mav.set_position_target_local_ned_send(
             0, self.master.target_system, self.master.target_component,
             mavutil.mavlink.MAV_FRAME_BODY_NED,
-            0b0000111111000111, 0,0,0, vx_fwd,vy_right,vz_down, 0,0,0, 0,0)
+            0b0000101111000111,  # bit 10 cleared → yaw active
+            0,0,0, vx_fwd,vy_right,vz_down, 0,0,0, yaw_rad, 0)
 
     def move_body(self, fwd_m, right_m, down_m):
         """Position offset relative to current pos + heading."""
