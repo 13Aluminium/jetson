@@ -110,6 +110,10 @@ DESCENT_VZ       = 0.30      # m/s — descent rate
 ACQUIRE_PATIENCE = 15.0      # seconds — if can't center above drop alt,
                              # descend anyway. Precision only matters at
                              # drop altitude, not above it.
+MIN_CORRECT_DIST = 0.5       # meters — ignore corrections below this
+                             # Big drone + wind gusts make sub-0.5m
+                             # corrections pointless — they just waste
+                             # time fighting turbulence
 
 # ── Video / overlay ───────────────────────────────────────────
 OVERLAY_FONT         = cv2.FONT_HERSHEY_SIMPLEX
@@ -853,6 +857,21 @@ def main(args):
                 # ── Not centered — send correction ───────────
                 m_fwd, m_right = pixels_to_meters(dx_px, dy_px, cur_alt)
                 dist_m = math.sqrt(m_fwd**2 + m_right**2)
+
+                # Skip micro-corrections that wind will overwhelm
+                if dist_m < MIN_CORRECT_DIST:
+                    if not args.dry_run:
+                        fc.stop()
+                    csv_row(csv_f, state, fc, cur_alt, det,
+                            dx_px, dy_px, m_fwd, m_right, dist_m,
+                            0, 0, 0, frame_num=frame_count,
+                            notes=f"skip_micro_{dist_m:.2f}m")
+                    print(f"\r  [ACQUIRE] offset {dist_m:.2f}m < {MIN_CORRECT_DIST}m "
+                          f"— holding | Alt={cur_alt:.1f}m   ",
+                          end="", flush=True)
+                    time.sleep(VEL_RATE)
+                    continue
+
                 scale = min(spd / dist_m, 1.0) if dist_m > spd else 0.5
                 vx = m_fwd * scale
                 vy = m_right * scale
@@ -1020,11 +1039,16 @@ def main(args):
                                                       drop_info=di)
                 else:
                     # Not centered — correct position, don't reset window
-                    scale = min(SPEED_LOW / dist_m, 1.0) if dist_m > SPEED_LOW else 0.4
-                    vx = m_fwd * scale
-                    vy = m_right * scale
-                    if not args.dry_run:
-                        fc.velocity_body(vx, vy, 0)
+                    if dist_m >= MIN_CORRECT_DIST:
+                        scale = min(SPEED_LOW / dist_m, 1.0) if dist_m > SPEED_LOW else 0.4
+                        vx = m_fwd * scale
+                        vy = m_right * scale
+                        if not args.dry_run:
+                            fc.velocity_body(vx, vy, 0)
+                    else:
+                        # Too small to fight wind — just hold
+                        if not args.dry_run:
+                            fc.stop()
 
                 csv_row(csv_f, state, fc, cur_alt, det,
                         dx_px, dy_px, m_fwd, m_right, dist_m,
@@ -1263,7 +1287,7 @@ if __name__ == "__main__":
                    help=f"Altitude to hover and drop (default {DROP_ALT}m)")
     p.add_argument("--weights", default="best_22.pt",
                    help="YOLO weights file")
-    p.add_argument("--conf", type=float, default=0.50,
+    p.add_argument("--conf", type=float, default=0.75,
                    help="YOLO confidence threshold")
     p.add_argument("--imgsz", type=int, default=640,
                    help="YOLO input size")
