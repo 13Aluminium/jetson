@@ -110,6 +110,10 @@ DESCENT_VZ       = 0.30      # m/s — descent rate
 ACQUIRE_PATIENCE = 15.0      # seconds — if can't center above drop alt,
                              # descend anyway. Precision only matters at
                              # drop altitude, not above it.
+MIN_CORRECT_DIST = 0.5       # meters — ignore corrections below this
+                             # Big drone + wind gusts make sub-0.5m
+                             # corrections pointless — they just waste
+                             # time fighting turbulence
 
 # ── Video / overlay ───────────────────────────────────────────
 OVERLAY_FONT         = cv2.FONT_HERSHEY_SIMPLEX
@@ -251,49 +255,6 @@ def median_gps(readings):
     lats = [r[0] for r in readings]
     lons = [r[1] for r in readings]
     return statistics.median(lats), statistics.median(lons)
-
-
-# ===========================================================================
-# YAW-LOCKED VELOCITY COMMAND
-# ===========================================================================
-
-def velocity_body_yaw_locked(fc, vx_fwd, vy_right, vz_down):
-    """
-    Send body-frame velocity WITH explicit yaw hold.
-
-    The default velocity_body in flight_utils sets type_mask bit 10
-    (ignore yaw), but ArduCopter's WP_YAW_BEHAVIOR parameter can
-    override this — if set to 1 or 3, the FC rotates the drone to
-    face the direction of movement, which rotates the downward camera
-    and makes all pixel-based corrections go haywire.
-
-    Fix: UNMASK bit 10 (tell FC "I AM setting yaw") and pass the
-    current heading. Every velocity command now says "move this
-    direction AND hold your current heading."
-
-    type_mask bits:
-      0-2:  111  ignore position
-      3-5:  000  USE velocity
-      6-8:  111  ignore acceleration
-      9:    1    ignore force
-      10:   0    USE yaw (explicitly hold current heading)
-      11:   1    ignore yaw rate
-
-    = 0b0000_1011_1100_0111 = 0x0BC7
-    """
-    current_yaw_rad = math.radians(fc.heading)
-    fc.master.mav.set_position_target_local_ned_send(
-        0,
-        fc.master.target_system,
-        fc.master.target_component,
-        mavutil.mavlink.MAV_FRAME_BODY_NED,
-        0b0000101111000111,       # USE yaw (bit 10 = 0)
-        0, 0, 0,                  # position (ignored)
-        vx_fwd, vy_right, vz_down,  # velocity (used)
-        0, 0, 0,                  # acceleration (ignored)
-        current_yaw_rad,          # yaw = HOLD current heading
-        0                         # yaw rate (ignored)
-    )
 
 
 # ===========================================================================
@@ -896,12 +857,27 @@ def main(args):
                 # ── Not centered — send correction ───────────
                 m_fwd, m_right = pixels_to_meters(dx_px, dy_px, cur_alt)
                 dist_m = math.sqrt(m_fwd**2 + m_right**2)
+
+                # Skip micro-corrections that wind will overwhelm
+                if dist_m < MIN_CORRECT_DIST:
+                    if not args.dry_run:
+                        fc.stop()
+                    csv_row(csv_f, state, fc, cur_alt, det,
+                            dx_px, dy_px, m_fwd, m_right, dist_m,
+                            0, 0, 0, frame_num=frame_count,
+                            notes=f"skip_micro_{dist_m:.2f}m")
+                    print(f"\r  [ACQUIRE] offset {dist_m:.2f}m < {MIN_CORRECT_DIST}m "
+                          f"— holding | Alt={cur_alt:.1f}m   ",
+                          end="", flush=True)
+                    time.sleep(VEL_RATE)
+                    continue
+
                 scale = min(spd / dist_m, 1.0) if dist_m > spd else 0.5
                 vx = m_fwd * scale
                 vy = m_right * scale
 
                 if not args.dry_run:
-                    velocity_body_yaw_locked(fc, vx, vy, 0)
+                    fc.velocity_body(vx, vy, 0)
 
                 csv_row(csv_f, state, fc, cur_alt, det,
                         dx_px, dy_px, m_fwd, m_right, dist_m,
@@ -1063,11 +1039,16 @@ def main(args):
                                                       drop_info=di)
                 else:
                     # Not centered — correct position, don't reset window
-                    scale = min(SPEED_LOW / dist_m, 1.0) if dist_m > SPEED_LOW else 0.4
-                    vx = m_fwd * scale
-                    vy = m_right * scale
-                    if not args.dry_run:
-                        velocity_body_yaw_locked(fc, vx, vy, 0)
+                    if dist_m >= MIN_CORRECT_DIST:
+                        scale = min(SPEED_LOW / dist_m, 1.0) if dist_m > SPEED_LOW else 0.4
+                        vx = m_fwd * scale
+                        vy = m_right * scale
+                        if not args.dry_run:
+                            fc.velocity_body(vx, vy, 0)
+                    else:
+                        # Too small to fight wind — just hold
+                        if not args.dry_run:
+                            fc.stop()
 
                 csv_row(csv_f, state, fc, cur_alt, det,
                         dx_px, dy_px, m_fwd, m_right, dist_m,
@@ -1306,7 +1287,7 @@ if __name__ == "__main__":
                    help=f"Altitude to hover and drop (default {DROP_ALT}m)")
     p.add_argument("--weights", default="best_22.pt",
                    help="YOLO weights file")
-    p.add_argument("--conf", type=float, default=0.50,
+    p.add_argument("--conf", type=float, default=0.75,
                    help="YOLO confidence threshold")
     p.add_argument("--imgsz", type=int, default=640,
                    help="YOLO input size")
