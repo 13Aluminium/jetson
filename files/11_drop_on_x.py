@@ -1127,7 +1127,7 @@ def main(args):
                 # Camera is centered on X but claw is CAM_OFFSET_FWD
                 # (0.38m) behind. Scoot forward blindly to put
                 # the claw directly over X, then drop.
-                scoot_dist = CAM_OFFSET_FWD
+                scoot_dist = 1.2
                 scoot_time = scoot_dist / BLIND_SCOOT_SPEED
 
                 log(log_f, "")
