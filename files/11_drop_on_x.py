@@ -64,7 +64,7 @@ from flight_utils import (FlightController, SafeFlight, open_camera,
                           load_yolo, detect_x, pixels_to_meters,
                           get_camera_fps,
                           TAKEOFF_ALT, FRAME_W, FRAME_H,
-                          CAM_OFFSET_FWD, HFOV_DEG,
+                          CAM_OFFSET_FWD,
                           confirm, create_log, log)
 
 # ===========================================================================
@@ -111,7 +111,14 @@ DESCENT_VZ       = 0.30      # m/s — descent rate
 ACQUIRE_PATIENCE = 15.0      # seconds — if can't center above drop alt,
                              # descend anyway. Precision only matters at
                              # drop altitude, not above it.
-MIN_CORRECT_DIST = 0.5       # meters — ignore corrections below this
+MIN_CORRECT_DIST      = 0.5  # meters — ACQUIRE: skip tiny corrections
+MIN_CORRECT_DIST_DROP = 0.2  # meters — DROP_CENTERING: tighter threshold
+
+# ── Blind scoot (camera→claw offset compensation) ────────────
+# After drop lock, stop CV, scoot forward by CAM_OFFSET_FWD
+# to put the CLAW (not camera) over X, then drop.
+BLIND_SCOOT_SPEED = 0.20     # m/s — gentle forward creep
+BLIND_SCOOT_HOLD  = 1.0      # seconds — hold after scoot for settling
 
 # ── Video / overlay ───────────────────────────────────────────
 OVERLAY_FONT         = cv2.FONT_HERSHEY_SIMPLEX
@@ -253,35 +260,6 @@ def median_gps(readings):
     lats = [r[0] for r in readings]
     lons = [r[1] for r in readings]
     return statistics.median(lats), statistics.median(lons)
-
-
-# ===========================================================================
-# CLAW-OFFSET CENTERING TARGET
-# ===========================================================================
-# The camera is mounted CAM_OFFSET_FWD (0.38m) FORWARD of the claw/drop
-# point. When the camera sees X at frame center, the claw is 0.38m behind.
-#
-# Fix: shift the "centered" target DOWN in the frame so that when X
-# appears at that offset position, the CLAW (not camera) is above X.
-#
-# At 3m: 0.38m ≈ 183px shift. The deadzone (80px) is checked around
-# this shifted target, not frame center.
-#
-# dx_px/dy_px for velocity commands still use frame center (pixels_to_meters
-# already adds CAM_OFFSET_FWD internally). Only the centering CHECK changes.
-
-def claw_target_cy(alt_m):
-    """
-    Compute the Y pixel where X should appear when the CLAW is above it.
-    Returns target_cy (shifted down from frame center by camera offset).
-    """
-    hfov = math.radians(HFOV_DEG)
-    vfov = hfov * (FRAME_H / FRAME_W)
-    gh = 2 * alt_m * math.tan(vfov / 2)
-    if gh <= 0:
-        return FRAME_H // 2
-    offset_px = int(CAM_OFFSET_FWD * (FRAME_H / gh))
-    return FRAME_H // 2 + offset_px
 
 
 # ===========================================================================
@@ -678,6 +656,7 @@ def main(args):
     log(log_f, f"Claw open:         {CLAW_OPEN_PWM}")
     log(log_f, f"Claw close:        {CLAW_CLOSE_PWM}")
     log(log_f, f"Post-drop hold:    {POST_DROP_HOLD}s")
+    log(log_f, f"Blind scoot:       {CAM_OFFSET_FWD}m fwd @ {BLIND_SCOOT_SPEED}m/s")
     log(log_f, f"YOLO weights:      {args.weights}")
     log(log_f, f"YOLO conf:         {args.conf}")
     log(log_f, f"Camera:            {FRAME_W}x{FRAME_H}")
@@ -836,22 +815,15 @@ def main(args):
                     continue
 
                 last_x = time.time()
-                # dx/dy relative to frame center — for velocity commands
                 dx_px = det['cx'] - FRAME_W // 2
                 dy_px = det['cy'] - FRAME_H // 2
-
-                # dx/dy relative to CLAW position — for centering check
-                # Camera is 0.38m ahead of claw, so X must appear below
-                # frame center for the claw to be directly above it
-                tgt_cy = claw_target_cy(cur_alt)
-                dy_claw = det['cy'] - tgt_cy
 
                 # Use wider deadzone near drop altitude
                 near_drop = cur_alt < drop_alt + 1.5
                 dz = DEADZONE_DROP if near_drop else DEADZONE_HIGH
                 spd = SPEED_LOW if near_drop else SPEED_HIGH
 
-                if abs(dx_px) <= dz and abs(dy_claw) <= dz:
+                if abs(dx_px) <= dz and abs(dy_px) <= dz:
                     # ── CENTERED ─────────────────────────────
                     m_fwd, m_right = pixels_to_meters(dx_px, dy_px, cur_alt)
                     dist_m = math.sqrt(m_fwd**2 + m_right**2)
@@ -892,7 +864,7 @@ def main(args):
                 m_fwd, m_right = pixels_to_meters(dx_px, dy_px, cur_alt)
                 dist_m = math.sqrt(m_fwd**2 + m_right**2)
 
-                # Skip micro-corrections that wind will overwhelm
+                # Skip micro-corrections that wind overwhelms at cruise alt
                 if dist_m < MIN_CORRECT_DIST:
                     if not args.dry_run:
                         fc.stop()
@@ -1043,11 +1015,8 @@ def main(args):
                 m_fwd, m_right = pixels_to_meters(dx_px, dy_px, cur_alt)
                 dist_m = math.sqrt(m_fwd**2 + m_right**2)
 
-                # Check centering against CLAW position, not camera
-                tgt_cy = claw_target_cy(cur_alt)
-                dy_claw = det['cy'] - tgt_cy
                 is_centered = (abs(dx_px) <= DEADZONE_DROP and
-                               abs(dy_claw) <= DEADZONE_DROP)
+                               abs(dy_px) <= DEADZONE_DROP)
 
                 drop_window.add_frame(is_centered, fc.lat, fc.lon,
                                        dx_px, dy_px)
@@ -1076,7 +1045,7 @@ def main(args):
                                                       drop_info=di)
                 else:
                     # Not centered — correct position, don't reset window
-                    if dist_m >= MIN_CORRECT_DIST:
+                    if dist_m >= MIN_CORRECT_DIST_DROP:
                         scale = min(SPEED_LOW / dist_m, 1.0) if dist_m > SPEED_LOW else 0.4
                         vx = m_fwd * scale
                         vy = m_right * scale
@@ -1139,7 +1108,7 @@ def main(args):
                           f"{drop_result['n_total']} centered | "
                           f"Spread: {drop_result['spread']:.3f}m | "
                           f"Time: {drop_elapsed:.1f}s")
-                    print(f"    → OPENING CLAW!\n")
+                    print(f"    → SCOOT FWD {CAM_OFFSET_FWD}m then DROP!\n")
 
                     state = "DROP"
                     if not args.dry_run:
@@ -1150,10 +1119,49 @@ def main(args):
                 time.sleep(VEL_RATE)
 
             # ══════════════════════════════════════════════════
-            # DROP — OPEN CLAW AND RELEASE PAYLOAD
+            # DROP — BLIND SCOOT + OPEN CLAW
             # ══════════════════════════════════════════════════
 
             elif state == "DROP":
+                # ── BLIND SCOOT: camera is over X, move fwd ──
+                # Camera is centered on X but claw is CAM_OFFSET_FWD
+                # (0.38m) behind. Scoot forward blindly to put
+                # the claw directly over X, then drop.
+                scoot_dist = CAM_OFFSET_FWD
+                scoot_time = scoot_dist / BLIND_SCOOT_SPEED
+
+                log(log_f, "")
+                log(log_f, "=" * 55)
+                log(log_f, f"  → BLIND SCOOT: {scoot_dist:.2f}m fwd "
+                           f"@ {BLIND_SCOOT_SPEED:.2f}m/s "
+                           f"({scoot_time:.1f}s)")
+                log(log_f, "=" * 55)
+
+                if not args.dry_run:
+                    scoot_t0 = time.time()
+                    while time.time() - scoot_t0 < scoot_time:
+                        fc.velocity_body(BLIND_SCOOT_SPEED, 0, 0)
+                        fc.poll()
+                        # Keep recording video during scoot
+                        if cap:
+                            ret, frm = cap.read()
+                            if ret:
+                                frame_count += process_frame(
+                                    frm, "DROP", None,
+                                    fc.alt, fc, vw, dropped=False)
+                        time.sleep(VEL_RATE)
+                    fc.stop()
+
+                log(log_f, f"  Scoot done — holding {BLIND_SCOOT_HOLD}s to settle")
+                if not args.dry_run:
+                    time.sleep(BLIND_SCOOT_HOLD)
+
+                csv_row(csv_f, "SCOOT_DONE", fc, cur_alt,
+                        drop_lat=drop_lat, drop_lon=drop_lon,
+                        frame_num=frame_count,
+                        notes=f"scoot_{scoot_dist:.2f}m_fwd")
+
+                # ── NOW OPEN THE CLAW ────────────────────────
                 log(log_f, "")
                 log(log_f, "=" * 55)
                 log(log_f, "  📦  OPENING CLAW — PAYLOAD AWAY!")
