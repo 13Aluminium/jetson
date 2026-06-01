@@ -52,7 +52,7 @@ TAKEOFF_ALT = 5.0  # meters
 FRAME_W = 1920
 FRAME_H = 1080
 HFOV_DEG = 73.0  # IMX477 full-sensor (4K/sensor-mode=0) horizontal FOV
-CAM_OFFSET_FWD = 1.5  # meters — camera is 0.38m FORWARD of drone center
+CAM_OFFSET_FWD = 0.8  # meters — camera is 0.38m FORWARD of drone center
 _measured_cam_fps = None  # set by open_camera() after measuring
 
 # YOLO
