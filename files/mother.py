@@ -76,7 +76,7 @@ from flask import Flask, Response, render_template_string
 from flight_utils import (
     FlightController, SafeFlight, open_camera, load_yolo, detect_x,
     pixels_to_meters, get_camera_fps,
-    TAKEOFF_ALT, FRAME_W, FRAME_H,
+    TAKEOFF_ALT, FRAME_W, FRAME_H, CAM_OFFSET_FWD,
     confirm, create_log, log,
 )
 
@@ -128,6 +128,15 @@ VEL_RATE           = 0.2    # seconds between velocity commands
 DESCENT_VZ         = 0.30   # m/s descent rate
 ACQUIRE_PATIENCE   = 15.0   # seconds to try centering before forced descend
 BATTERY_MIN        = 20     # percent — RTL if below
+MIN_CORRECT_DIST      = 0.5  # meters — ACQUIRING: skip tiny corrections
+MIN_CORRECT_DIST_DROP = 0.2  # meters — DROP_ALIGNMENT: tighter threshold
+
+# ── Blind scoot (camera→claw offset compensation) ────────────
+# After drop lock, stop CV, scoot forward by offset to put the
+# CLAW (not camera) over X, then drop.
+BLIND_SCOOT_DIST  = 1.2      # meters — total forward scoot
+BLIND_SCOOT_SPEED = 0.20     # m/s — gentle forward creep
+BLIND_SCOOT_HOLD  = 1.0      # seconds — hold after scoot for settling
 
 # ── Video / overlay ──────────────────────────────────────────
 OVERLAY_FONT      = cv2.FONT_HERSHEY_SIMPLEX
@@ -693,6 +702,8 @@ def main(args):
     log(log_f, f"Time limit:      {MISSION_TIME_LIMIT}s")
     log(log_f, f"YOLO weights:    {args.weights}")
     log(log_f, f"YOLO conf:       {args.conf}")
+    log(log_f, f"Blind scoot:     {BLIND_SCOOT_DIST}m fwd @ {BLIND_SCOOT_SPEED}m/s")
+    log(log_f, f"Min correct:     {MIN_CORRECT_DIST}m (cruise) / {MIN_CORRECT_DIST_DROP}m (drop)")
     log(log_f, "")
 
     with SafeFlight(fc, camera=cap, video_writer=vw) as sf:
@@ -1151,6 +1162,23 @@ def main(args):
                 # Not centered — correct
                 m_fwd, m_right = pixels_to_meters(dx_px, dy_px, cur_alt)
                 dist_m = math.sqrt(m_fwd**2 + m_right**2)
+
+                # Skip micro-corrections that wind overwhelms at cruise alt
+                if dist_m < MIN_CORRECT_DIST:
+                    if not args.dry_run:
+                        fc.stop()
+                    csv_row(csv_f, state, fc, cur_alt, det,
+                            dx_px, dy_px, m_fwd, m_right, dist_m,
+                            0, 0, 0,
+                            mission_elapsed=time.time() - mission_t0,
+                            frame_num=frame_count[0],
+                            notes=f"skip_micro_{dist_m:.2f}m")
+                    print(f"\r  [ACQUIRING] offset {dist_m:.2f}m < "
+                          f"{MIN_CORRECT_DIST}m — holding   ",
+                          end="", flush=True)
+                    time.sleep(VEL_RATE)
+                    continue
+
                 scale = min(spd / dist_m, 1.0) if dist_m > spd else 0.5
                 vx = m_fwd * scale
                 vy = m_right * scale
@@ -1269,11 +1297,16 @@ def main(args):
                             centered=True, drop_info=di,
                             mission_elapsed=time.time() - mission_t0)
                 else:
-                    scale = min(SPEED_LOW / dist_m, 1.0) if dist_m > SPEED_LOW else 0.4
-                    vx = m_fwd * scale
-                    vy = m_right * scale
-                    if not args.dry_run:
-                        fc.velocity_body(vx, vy, 0)
+                    # Not centered — correct, but skip micro-corrections
+                    if dist_m >= MIN_CORRECT_DIST_DROP:
+                        scale = min(SPEED_LOW / dist_m, 1.0) if dist_m > SPEED_LOW else 0.4
+                        vx = m_fwd * scale
+                        vy = m_right * scale
+                        if not args.dry_run:
+                            fc.velocity_body(vx, vy, 0)
+                    else:
+                        if not args.dry_run:
+                            fc.stop()
 
                 csv_row(csv_f, state, fc, cur_alt, det,
                         dx_px, dy_px, m_fwd, m_right, dist_m,
@@ -1307,7 +1340,7 @@ def main(args):
                     log(log_f, "=" * 55)
 
                     print(f"\n\n  ★ DROP LOCKED at ({drop_lat:.8f}, {drop_lon:.8f})")
-                    print(f"    → OPENING CLAW!\n")
+                    print(f"    → SCOOT FWD {BLIND_SCOOT_DIST}m then DROP!\n")
 
                     state = "DROPPING"
                     if not args.dry_run:
@@ -1318,10 +1351,52 @@ def main(args):
                 time.sleep(VEL_RATE)
 
             # ══════════════════════════════════════════════════
-            # DROP — OPEN CLAW
+            # DROP — BLIND SCOOT + OPEN CLAW
             # ══════════════════════════════════════════════════
             elif state == "DROPPING":
-                log(log_f, "📦 OPENING CLAW — PAYLOAD AWAY!")
+                # ── BLIND SCOOT: camera is over X, move fwd ──
+                # Camera is centered on X but the claw is behind
+                # the camera. Scoot forward blindly to put the
+                # claw directly over X, then drop.
+                scoot_time = BLIND_SCOOT_DIST / BLIND_SCOOT_SPEED
+
+                log(log_f, "")
+                log(log_f, "=" * 55)
+                log(log_f, f"  → BLIND SCOOT: {BLIND_SCOOT_DIST:.2f}m fwd "
+                           f"@ {BLIND_SCOOT_SPEED:.2f}m/s "
+                           f"({scoot_time:.1f}s)")
+                log(log_f, "=" * 55)
+
+                if not args.dry_run:
+                    scoot_t0 = time.time()
+                    while time.time() - scoot_t0 < scoot_time:
+                        fc.velocity_body(BLIND_SCOOT_SPEED, 0, 0)
+                        fc.poll()
+                        if cap:
+                            ret, frm = cap.read()
+                            if ret:
+                                frame_count[0] += process_frame(
+                                    frm, "DROPPING", None, fc.alt, fc, vw,
+                                    dropped=False,
+                                    mission_elapsed=time.time() - mission_t0)
+                        time.sleep(VEL_RATE)
+                    fc.stop()
+
+                log(log_f, f"  Scoot done — holding {BLIND_SCOOT_HOLD}s to settle")
+                if not args.dry_run:
+                    time.sleep(BLIND_SCOOT_HOLD)
+
+                csv_row(csv_f, "SCOOT_DONE", fc, cur_alt,
+                        drop_lat=drop_lat, drop_lon=drop_lon,
+                        mission_elapsed=time.time() - mission_t0,
+                        frame_num=frame_count[0],
+                        notes=f"scoot_{BLIND_SCOOT_DIST:.2f}m_fwd")
+
+                # ── NOW OPEN THE CLAW ────────────────────────
+                log(log_f, "")
+                log(log_f, "=" * 55)
+                log(log_f, "  📦  OPENING CLAW — PAYLOAD AWAY!")
+                log(log_f, "=" * 55)
 
                 if not args.dry_run:
                     set_claw(fc, CLAW_OPEN_PWM, log_f)
@@ -1483,7 +1558,7 @@ Examples:
     # ── YOLO ──
     p.add_argument("--weights", default="best_22.pt",
                    help="YOLO weights file")
-    p.add_argument("--conf", type=float, default=0.50,
+    p.add_argument("--conf", type=float, default=0.75,
                    help="YOLO confidence threshold")
     p.add_argument("--imgsz", type=int, default=640,
                    help="YOLO input size")
