@@ -117,8 +117,8 @@ DROP_TIMEOUT          = 45.0   # seconds
 
 # ── Claw ──────────────────────────────────────────────────────
 CLAW_CHANNEL      = 6
-CLAW_OPEN_PWM     = 2000
-CLAW_CLOSE_PWM    = 1000
+CLAW_OPEN_PWM     = 1000
+CLAW_CLOSE_PWM    = 1550
 POST_DROP_HOLD    = 3.0     # seconds after claw open
 
 # ── Safety ────────────────────────────────────────────────────
