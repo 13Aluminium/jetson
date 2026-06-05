@@ -98,8 +98,8 @@ DROP_TIMEOUT         = 45.0  # seconds — max time in drop centering phase
 
 # ── Claw control ─────────────────────────────────────────────
 CLAW_CHANNEL     = 6         # RC channel for claw servo
-CLAW_OPEN_PWM    = 2000      # PWM to open claw (release payload)
-CLAW_CLOSE_PWM   = 1000      # PWM to close claw (grip payload)
+CLAW_OPEN_PWM    = 1000      # PWM to open claw (release payload)
+CLAW_CLOSE_PWM   = 1550      # PWM to close claw (grip payload)
 POST_DROP_HOLD   = 3.0       # seconds to hold position after drop
                              # Lets payload fall clear before RTL
 
