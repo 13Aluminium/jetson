@@ -128,6 +128,7 @@ VEL_RATE           = 0.2    # seconds between velocity commands
 DESCENT_VZ         = 0.30   # m/s descent rate
 ACQUIRE_PATIENCE   = 15.0   # seconds to try centering before forced descend
 BATTERY_MIN        = 20     # percent — RTL if below
+SAFE_RTL_ALT       = 5.0    # meters — climb to this alt before any RTL
 MIN_CORRECT_DIST      = 0.5  # meters — ACQUIRING: skip tiny corrections
 MIN_CORRECT_DIST_DROP = 0.2  # meters — DROP_ALIGNMENT: tighter threshold
 
@@ -284,6 +285,48 @@ def release_rc_override(fc):
     fc.master.mav.rc_channels_override_send(
         fc.master.target_system, fc.master.target_component,
         0, 0, 0, 0, 0, 0, 0, 0)
+
+
+def safe_rtl(fc, log_f, cap=None, vw=None, frame_count_ref=None,
+             mission_t0=None, safe_alt=SAFE_RTL_ALT):
+    """Climb to safe altitude before commanding RTL.
+
+    Prevents low-altitude RTL that could crash into obstacles.
+    Always closes claw and releases RC overrides before RTL.
+    """
+    set_claw(fc, CLAW_CLOSE_PWM, log_f)
+    time.sleep(0.3)
+    release_rc_override(fc)
+    time.sleep(0.2)
+
+    fc.poll()
+    cur = fc.alt
+    if cur < safe_alt - 0.5:
+        log(log_f, f"SAFE RTL: climbing {cur:.1f}m → {safe_alt:.1f}m before RTL")
+        t0 = time.time()
+        while time.time() - t0 < 20:               # 20s safety timeout
+            fc.poll()
+            if fc.alt >= safe_alt - 0.3:
+                break
+            fc.velocity_ned(0, 0, -0.5)             # climb 0.5 m/s
+            # keep recording video while climbing
+            if cap and vw and frame_count_ref is not None:
+                ret, frm = cap.read()
+                if ret:
+                    elapsed = time.time() - mission_t0 if mission_t0 else 0
+                    frame_count_ref[0] += process_frame(
+                        frm, "CLIMBING_RTL", None, fc.alt, fc, vw,
+                        mission_elapsed=elapsed,
+                        extra_info=f"Climbing to {safe_alt:.0f}m for RTL")
+            time.sleep(0.2)
+        fc.stop()
+        time.sleep(0.5)
+        log(log_f, f"SAFE RTL: at {fc.alt:.1f}m — commanding RTL")
+    else:
+        log(log_f, f"SAFE RTL: already at {cur:.1f}m — commanding RTL")
+
+    fc.set_rtl()
+    log(log_f, "RTL commanded")
 
 
 # ===========================================================================
@@ -754,10 +797,7 @@ def main(args):
                         frame_num=frame_count[0], notes="TIME_LIMIT_RTL")
                 if not args.dry_run:
                     fc.stop()
-                    set_claw(fc, CLAW_CLOSE_PWM, log_f)
-                    time.sleep(0.3)
-                    release_rc_override(fc)
-                    fc.set_rtl()
+                    safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
                 state = "ABORT"
                 continue
 
@@ -768,10 +808,7 @@ def main(args):
                         "RETURNING", "DONE", "ABORT"):
                     log(log_f, f"🔋 BATTERY LOW ({fc.battery_pct}%) → RTL")
                     fc.stop()
-                    set_claw(fc, CLAW_CLOSE_PWM, log_f)
-                    time.sleep(0.3)
-                    release_rc_override(fc)
-                    fc.set_rtl()
+                    safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
                     state = "ABORT"
                     continue
 
@@ -787,6 +824,28 @@ def main(args):
                 else:
                     frame = None
 
+            # ── Always process frame for video/feed (matches script 11) ──
+            # This keeps the camera buffer drained and the live feed
+            # updated even when a state handler doesn't process the frame
+            # (e.g., ACQUIRING when det is None). Without this, the
+            # camera buffer can go stale on Jetson, causing repeated
+            # identical frames and missed detections.
+            if frame is not None and state not in ("LAUNCH", "TRANSIT"):
+                drop_info_overlay = None
+                if state == "DROP_ALIGNMENT":
+                    drop_info_overlay = {
+                        'n_centered': drop_window.centered_count,
+                        'n_total': drop_window.total_frames,
+                        'required': DROP_MIN_CENTERED,
+                        'hit_rate': drop_window.hit_rate,
+                        'window_entries': [e[1] for e in drop_window.buffer],
+                    }
+                frame_count[0] += process_frame(
+                    frame, state, det, cur_alt, fc, vw,
+                    drop_info=drop_info_overlay,
+                    dropped=payload_dropped,
+                    mission_elapsed=time.time() - mission_t0)
+
             # ══════════════════════════════════════════════════
             # LAUNCH
             # ══════════════════════════════════════════════════
@@ -799,9 +858,11 @@ def main(args):
                 if not fc.arm():
                     state = "ABORT"; continue
                 if not fc.takeoff(args.alt):
-                    fc.set_rtl(); state = "ABORT"; continue
+                    safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
+                    state = "ABORT"; continue
                 if not fc.wait_alt(args.alt):
-                    fc.set_rtl(); state = "ABORT"; continue
+                    safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
+                    state = "ABORT"; continue
 
                 log(log_f, f"At {fc.alt:.1f}m — stabilizing 5s for EKF alignment")
                 t0 = time.time()
@@ -849,7 +910,8 @@ def main(args):
                     # Mission timer check during nav
                     if mission_elapsed > MISSION_TIME_LIMIT:
                         log(log_f, "TIME LIMIT during navigation → RTL")
-                        fc.stop(); fc.set_rtl()
+                        fc.stop()
+                        safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
                         state = "ABORT"; break
 
                     # Resend goto every 2s
@@ -1062,7 +1124,7 @@ def main(args):
                             frame_num=frame_count[0], notes="CROSS_EXHAUSTED_RTL")
                     if not args.dry_run:
                         fc.stop()
-                        fc.set_rtl()
+                        safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
                     state = "ABORT"
                     continue
 
@@ -1114,7 +1176,8 @@ def main(args):
                                 mission_elapsed=time.time() - mission_t0,
                                 frame_num=frame_count[0], notes="LOST_TIMEOUT_RTL")
                         if not args.dry_run:
-                            fc.stop(); fc.set_rtl()
+                            fc.stop()
+                            safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
                         state = "ABORT"; continue
                     if not args.dry_run:
                         fc.stop()
@@ -1252,7 +1315,8 @@ def main(args):
                 if drop_elapsed > DROP_TIMEOUT:
                     log(log_f, f"DROP TIMEOUT ({DROP_TIMEOUT}s) → RTL")
                     if not args.dry_run:
-                        fc.stop(); fc.set_rtl()
+                        fc.stop()
+                        safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
                     state = "ABORT"; continue
 
                 if det is None:
@@ -1260,7 +1324,8 @@ def main(args):
                     if lost > LOST_TIMEOUT:
                         log(log_f, f"LOST during drop centering {lost:.0f}s → RTL")
                         if not args.dry_run:
-                            fc.stop(); fc.set_rtl()
+                            fc.stop()
+                            safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
                         state = "ABORT"; continue
                     if not args.dry_run:
                         fc.stop()
@@ -1436,15 +1501,10 @@ def main(args):
             # POST DROP — close claw, RTL
             # ══════════════════════════════════════════════════
             elif state == "RETURNING":
-                log(log_f, "Closing claw → RTL")
+                log(log_f, "Post-drop → safe RTL")
 
                 if not args.dry_run:
-                    set_claw(fc, CLAW_CLOSE_PWM, log_f)
-                    time.sleep(0.5)
-                    release_rc_override(fc)
-                    time.sleep(0.3)
-                    fc.set_rtl()
-                    log(log_f, "RTL commanded")
+                    safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
 
                     rtl_t0 = time.time()
                     while fc.armed and (time.time() - rtl_t0 < 120):
@@ -1558,7 +1618,7 @@ Examples:
     # ── YOLO ──
     p.add_argument("--weights", default="best_22.pt",
                    help="YOLO weights file")
-    p.add_argument("--conf", type=float, default=0.75,
+    p.add_argument("--conf", type=float, default=0.65,
                    help="YOLO confidence threshold")
     p.add_argument("--imgsz", type=int, default=640,
                    help="YOLO input size")
