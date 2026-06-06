@@ -1363,7 +1363,7 @@ Examples:
     p.add_argument("--timer", type=int, default=MISSION_TIME_LIMIT_DEFAULT,
                    help=f"Mission time limit in seconds — RTL when expired (default {MISSION_TIME_LIMIT_DEFAULT})")
 
-    p.add_argument("--weights", default="best_22.pt",
+    p.add_argument("--weights", default="gol.pt",
                    help="YOLO weights file")
     p.add_argument("--conf", type=float, default=0.50,
                    help="YOLO confidence threshold (lower than mother — we WANT to see if it detects)")
