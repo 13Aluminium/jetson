@@ -33,12 +33,8 @@ Photo capture:
     The video recording has overlays for review.
 
 Usage:
-    python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX
+python3 recon_mission.py --lat 35.049578 --lon -118.151348 --alt 10 --max-alt 12 --recon-alt 3
 
-    python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX --speed 2.0 \\
-                             --alt 5 --recon-alt 3
-
-    python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX --dry-run
 
 Terminal 1: mavproxy.py --master=/dev/ttyACM0 --baudrate=115200 \\
             --out=udp:127.0.0.1:14551
