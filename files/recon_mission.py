@@ -1040,20 +1040,42 @@ def main(args):
                 if det is None:
                     lost = time.time() - last_x
                     if lost > LOST_TIMEOUT:
-                        log(log_f, f"LOST X {lost:.0f}s -> RTL")
-                        csv_row(csv_f, state, fc, cur_alt,
-                                mission_elapsed=time.time() - mission_t0,
-                                frame_num=frame_count[0],
-                                photo_count=photo_cap.count,
-                                notes="LOST_TIMEOUT_RTL")
+                        # RECON BEHAVIOR: descend instead of RTL
+                        # Target gets bigger in frame as we go lower,
+                        # and we want photos at every altitude regardless
                         if not args.dry_run:
                             fc.stop()
-                            safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
-                        state = "ABORT"; continue
+
+                        if cur_alt > recon_alt + 0.8:
+                            # Still above recon alt — descend to get closer
+                            log(log_f, f"LOST X {lost:.0f}s at {cur_alt:.1f}m — "
+                                       f"DESCENDING anyway (recon mode, target may reappear)")
+                            csv_row(csv_f, state, fc, cur_alt,
+                                    mission_elapsed=time.time() - mission_t0,
+                                    frame_num=frame_count[0],
+                                    photo_count=photo_cap.count,
+                                    notes=f"LOST_DESCEND_alt={cur_alt:.1f}")
+                            state = "DESCENDING"
+                            descend_tgt = max(cur_alt - DESCEND_STEP, recon_alt)
+                            last_x = time.time()  # reset lost timer for next altitude
+                            time.sleep(0.5)
+                            continue
+                        else:
+                            # Already at recon alt — go to RECON_HOLD and keep taking photos
+                            log(log_f, f"LOST X {lost:.0f}s at recon alt — "
+                                       f"RECON_HOLD anyway (capturing photos)")
+                            csv_row(csv_f, state, fc, cur_alt,
+                                    mission_elapsed=time.time() - mission_t0,
+                                    frame_num=frame_count[0],
+                                    photo_count=photo_cap.count,
+                                    notes="LOST_RECON_HOLD")
+                            state = "RECON_HOLD"
+                            last_x = time.time()
+                            continue
                     if not args.dry_run:
                         fc.stop()
                     print(f"\r  [ACQUIRE] Lost X — holding ({lost:.1f}s / "
-                          f"{LOST_TIMEOUT:.0f}s)   ", end="", flush=True)
+                          f"{LOST_TIMEOUT:.0f}s) will descend   ", end="", flush=True)
                     time.sleep(VEL_RATE)
                     continue
 
@@ -1176,20 +1198,17 @@ def main(args):
             elif state == "RECON_HOLD":
                 # This is where the mother script would do DROP_ALIGNMENT.
                 # Instead, we just keep centering and collecting data.
-                # The global timer will pull us out when 180s expires.
+                # The global timer will pull us out when it expires.
+                # NO RTL on lost X — just hold position and keep photographing.
 
                 if det is None:
                     lost = time.time() - last_x
-                    if lost > LOST_TIMEOUT:
-                        log(log_f, f"LOST X during recon hold {lost:.0f}s -> RTL")
-                        if not args.dry_run:
-                            fc.stop()
-                            safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0)
-                        state = "ABORT"; continue
                     if not args.dry_run:
                         fc.stop()
-                    print(f"\r  [RECON] Lost X — holding ({lost:.1f}s / "
-                          f"{LOST_TIMEOUT:.0f}s)   ", end="", flush=True)
+                    remaining_t = max(0, MISSION_TIME_LIMIT - mission_elapsed)
+                    print(f"\r  [RECON] Lost X ({lost:.1f}s) — holding + photographing  "
+                          f"photos={photo_cap.count}  T-{remaining_t:.0f}s   ",
+                          end="", flush=True)
                     time.sleep(VEL_RATE)
                     continue
 
@@ -1321,8 +1340,6 @@ RECON MISSION — validates YOLO model on real target, captures training photos.
 NO payload drop. 3-minute hard timer.
 
 Examples:
-python3 recon_mission.py --lat 35.049578 --lon -118.151348 --alt 10 --max-alt 12 --recon-alt 3 --timer 160
-
   python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX
   python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX --speed 2.0
   python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX --recon-alt 3
