@@ -33,8 +33,12 @@ Photo capture:
     The video recording has overlays for review.
 
 Usage:
-python3 recon_mission.py --lat 35.049578 --lon -118.151348 --alt 10 --max-alt 12 --recon-alt 3
+    python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX
 
+    python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX --speed 2.0 \\
+                             --alt 5 --recon-alt 3
+
+    python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX --dry-run
 
 Terminal 1: mavproxy.py --master=/dev/ttyACM0 --baudrate=115200 \\
             --out=udp:127.0.0.1:14551
@@ -95,7 +99,8 @@ SPEED_LOW         = 0.15    # m/s centering speed near recon alt
 RECON_ALT_DEFAULT = 3.0     # meters — hover and observe
 
 # ── Safety ────────────────────────────────────────────────────
-MISSION_TIME_LIMIT = 180    # 3 MINUTES — hard RTL
+MISSION_TIME_LIMIT_DEFAULT = 180    # 3 MINUTES — hard RTL
+MISSION_TIME_LIMIT = MISSION_TIME_LIMIT_DEFAULT  # overridden by --timer
 LOST_TIMEOUT       = 10.0   # seconds without YOLO → RTL
 VEL_RATE           = 0.2
 DESCENT_VZ         = 0.30
@@ -549,6 +554,9 @@ def csv_row(f, state, fc, cur_alt, det=None,
 # ===========================================================================
 
 def main(args):
+    global MISSION_TIME_LIMIT
+    MISSION_TIME_LIMIT = args.timer
+
     recon_alt = args.recon_alt
     target_lat = args.lat
     target_lon = args.lon
@@ -568,7 +576,7 @@ def main(args):
             f"  Target GPS:  ({target_lat:.8f}, {target_lon:.8f})\n"
             f"  Cruise alt:  {args.alt}m  |  Max alt: {args.max_alt}m  |  Recon alt: {recon_alt}m\n"
             f"  Speed:       {args.speed} m/s\n"
-            f"  Time limit:  {MISSION_TIME_LIMIT}s (3 min)\n"
+            f"  Time limit:  {MISSION_TIME_LIMIT}s ({MISSION_TIME_LIMIT/60:.1f} min)\n"
             f"  Plan: Takeoff -> Fly to GPS -> Search -> Center -> Descend to {recon_alt}m -> HOLD (no drop) -> RTL\n"
             f"  Photos saved every {PHOTO_INTERVAL}s for training data"
         )
@@ -636,7 +644,7 @@ def main(args):
     log(log_f, f"Max alt:         {args.max_alt}m")
     log(log_f, f"Recon alt:       {recon_alt}m")
     log(log_f, f"Speed:           {args.speed} m/s")
-    log(log_f, f"Time limit:      {MISSION_TIME_LIMIT}s (3 min)")
+    log(log_f, f"Time limit:      {MISSION_TIME_LIMIT}s ({MISSION_TIME_LIMIT/60:.1f} min)")
     log(log_f, f"Photo interval:  {PHOTO_INTERVAL}s")
     log(log_f, f"Photo dir:       {photo_dir}/")
     log(log_f, f"YOLO weights:    {args.weights}")
@@ -1313,6 +1321,8 @@ RECON MISSION — validates YOLO model on real target, captures training photos.
 NO payload drop. 3-minute hard timer.
 
 Examples:
+python3 recon_mission.py --lat 35.049578 --lon -118.151348 --alt 10 --max-alt 12 --recon-alt 3 --timer 160
+
   python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX
   python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX --speed 2.0
   python3 recon_mission.py --lat 35.05XXX --lon -118.15XXX --recon-alt 3
@@ -1333,6 +1343,8 @@ Examples:
                    help="Maximum search altitude (default 10 — lower than mother since time is short)")
     p.add_argument("--recon-alt", type=float, default=RECON_ALT_DEFAULT,
                    help=f"Altitude to hover and observe (default {RECON_ALT_DEFAULT})")
+    p.add_argument("--timer", type=int, default=MISSION_TIME_LIMIT_DEFAULT,
+                   help=f"Mission time limit in seconds — RTL when expired (default {MISSION_TIME_LIMIT_DEFAULT})")
 
     p.add_argument("--weights", default="best_22.pt",
                    help="YOLO weights file")
