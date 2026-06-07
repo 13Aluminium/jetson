@@ -19,8 +19,8 @@ The "mother script" that chains everything together:
     7. DROPPING — open claw, release payload
     8. RETURNING — close claw, RTL home
 
-    Global mission timer (--time-limit, default 5 min) — RTL if exceeded.
     On any failure, claw opens to drop payload before RTL.
+    Pilot can trigger RTL from RC at any time.
 
 Phase Names:
     LAUNCH            Takeoff to cruise altitude
@@ -47,8 +47,7 @@ Usage:
     python3 mother.py --lat 33.78310 --lon -118.10940 --speed 0.5 \\
                       --alt 5 --max-alt 15 --drop-alt 3
 
-    python3 mother.py --lat 33.78310 --lon -118.10940 --time-limit 180 \\
-                      --cross-dist 5
+    python3 mother.py --lat 33.78310 --lon -118.10940 --cross-dist 5
 
     python3 mother.py --lat 33.78310 --lon -118.10940 --dry-run
 
@@ -57,8 +56,9 @@ Terminal 1: mavproxy.py --master=/dev/ttyACM0 --baudrate=115200 \\
 Terminal 2: python3 mother.py --lat <lat> --lon <lon>
 
 Failsafes:
-    Ctrl+C → RTL | Exception → RTL | Mission timer → RTL
-    X lost 10s during centering → RTL | Battery < 20% → RTL
+    Ctrl+C → RTL | Exception → RTL | Pilot RC → RTL
+    X lost 10s during centering → RTL
+    Battery failsafe handled by Pixhawk firmware.
     ALL failure paths open claw (drop payload) before RTL —
     the drone never returns with payload still attached.
 """
@@ -126,12 +126,10 @@ CLAW_CLOSE_PWM    = 1550
 POST_DROP_HOLD    = 3.0     # seconds after claw open
 
 # ── Safety ────────────────────────────────────────────────────
-MISSION_TIME_LIMIT = 300    # 5 minutes — hard RTL
 LOST_TIMEOUT       = 10.0   # seconds without YOLO → RTL during centering
 VEL_RATE           = 0.2    # seconds between velocity commands
 DESCENT_VZ         = 0.30   # m/s descent rate
 ACQUIRE_PATIENCE   = 15.0   # seconds to try centering before forced descend
-BATTERY_MIN        = 20     # percent — RTL if below
 SAFE_RTL_ALT       = 5.0    # meters — climb to this alt before any RTL
 MIN_CORRECT_DIST      = 0.5  # meters — ACQUIRING: skip tiny corrections
 MIN_CORRECT_DIST_DROP = 0.2  # meters — DROP_ALIGNMENT: tighter threshold
@@ -473,10 +471,11 @@ def draw_overlay(frame, state, det, cur_alt, fc,
     cv2.putText(frame, f"PHASE: {state}", (w - 320, 25),
                 OVERLAY_FONT, 0.6, pc, 2)
 
-    # Mission timer
-    remaining = max(0, MISSION_TIME_LIMIT - mission_elapsed)
-    timer_color = COLOR_LOST if remaining < 60 else COLOR_OK
-    cv2.putText(frame, f"T-{remaining:.0f}s", (w - 120, 55),
+    # Mission elapsed timer
+    timer_color = COLOR_OK
+    mins = int(mission_elapsed) // 60
+    secs = int(mission_elapsed) % 60
+    cv2.putText(frame, f"T+{mins}:{secs:02d}", (w - 120, 55),
                 OVERLAY_FONT, 0.6, timer_color, 2)
 
     # HUD
@@ -680,8 +679,7 @@ def move_body_and_scan(fc, cap, model, conf, imgsz, fwd, right,
 # ===========================================================================
 
 def main(args):
-    global MISSION_TIME_LIMIT, CROSS_PROBE_DIST
-    MISSION_TIME_LIMIT = args.time_limit
+    global CROSS_PROBE_DIST
     CROSS_PROBE_DIST = args.cross_dist
 
     drop_alt = args.drop_alt
@@ -704,7 +702,6 @@ def main(args):
             f"  Target GPS:  ({target_lat:.8f}, {target_lon:.8f})\n"
             f"  Cruise alt:  {args.alt}m  |  Max alt: {args.max_alt}m  |  Drop alt: {drop_alt}m\n"
             f"  Speed:       {args.speed} m/s\n"
-            f"  Time limit:  {MISSION_TIME_LIMIT:.0f}s\n"
             f"  Cross sweep: {CROSS_PROBE_DIST:.1f}m legs\n"
             f"  Plan: Takeoff → Fly to GPS → Search for X → Center → Drop payload → RTL"
         )
@@ -765,7 +762,6 @@ def main(args):
     log(log_f, f"Max alt:         {args.max_alt}m")
     log(log_f, f"Drop alt:        {drop_alt}m")
     log(log_f, f"Speed:           {args.speed} m/s")
-    log(log_f, f"Time limit:      {MISSION_TIME_LIMIT:.0f}s")
     log(log_f, f"Cross sweep:     {CROSS_PROBE_DIST:.1f}m legs")
     log(log_f, f"YOLO weights:    {args.weights}")
     log(log_f, f"YOLO conf:       {args.conf}")
@@ -811,32 +807,12 @@ def main(args):
         # ══════════════════════════════════════════════════════
         while state not in ("DONE", "ABORT"):
 
-            # ── Global mission timer ─────────────────────────
+            # ── Track elapsed time (for logging/overlay) ─────
             mission_elapsed = time.time() - mission_t0
-            if mission_elapsed > MISSION_TIME_LIMIT and state not in (
-                    "RETURNING", "DONE", "ABORT"):
-                log(log_f, f"⏰ MISSION TIME LIMIT ({MISSION_TIME_LIMIT}s) → RTL")
-                csv_row(csv_f, state, fc, fc.alt if not args.dry_run else args.alt,
-                        mission_elapsed=mission_elapsed,
-                        frame_num=frame_count[0], notes="TIME_LIMIT_RTL")
-                if not args.dry_run:
-                    fc.stop()
-                    safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0,
-                             drop_first=True)
-                state = "ABORT"
-                continue
 
-            # ── Battery check ────────────────────────────────
+            # ── Poll FC ──────────────────────────────────────
             if not args.dry_run:
                 fc.poll()
-                if 0 < fc.battery_pct < BATTERY_MIN and state not in (
-                        "RETURNING", "DONE", "ABORT"):
-                    log(log_f, f"🔋 BATTERY LOW ({fc.battery_pct}%) → RTL")
-                    fc.stop()
-                    safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0,
-                             drop_first=True)
-                    state = "ABORT"
-                    continue
 
             cur_alt = fc.alt if (not args.dry_run and fc.alt > 0.3) else args.alt
 
@@ -933,14 +909,6 @@ def main(args):
                     now = time.time()
                     mission_elapsed = now - mission_t0
 
-                    # Mission timer check during nav
-                    if mission_elapsed > MISSION_TIME_LIMIT:
-                        log(log_f, "TIME LIMIT during navigation → RTL")
-                        fc.stop()
-                        safe_rtl(fc, log_f, cap, vw, frame_count, mission_t0,
-                                 drop_first=True)
-                        state = "ABORT"; break
-
                     # Resend goto every 2s
                     if now - last_cmd >= 2.0:
                         send_goto(fc, target_lat, target_lon, args.alt)
@@ -965,7 +933,7 @@ def main(args):
 
                     print(f"\r  [NAV] {pct:5.1f}%  rem={remaining:.1f}m  "
                           f"alt={fc.alt:.1f}m  sats={fc.satellites}  "
-                          f"batt={fc.battery_pct}%  T-{MISSION_TIME_LIMIT-mission_elapsed:.0f}s   ",
+                          f"batt={fc.battery_pct}%  T+{mission_elapsed:.0f}s   ",
                           end="", flush=True)
 
                     if remaining <= ARRIVE_RADIUS:
@@ -1633,7 +1601,7 @@ Examples:
   python3 mother.py --lat 33.78310 --lon -118.10940
   python3 mother.py --lat 33.78310 --lon -118.10940 --speed 0.5 --alt 5
   python3 mother.py --lat 33.78310 --lon -118.10940 --alt 8 --max-alt 20 --drop-alt 3
-  python3 mother.py --lat 33.78310 --lon -118.10940 --time-limit 180 --cross-dist 5
+  python3 mother.py --lat 33.78310 --lon -118.10940 --cross-dist 5
   python3 mother.py --lat 33.78310 --lon -118.10940 --dry-run
   python3 mother.py --lat 33.78310 --lon -118.10940 --sitl
 """)
@@ -1655,7 +1623,7 @@ Examples:
                    help=f"Altitude to hover and drop payload (default {DROP_ALT_DEFAULT})")
 
     # ── YOLO ──
-    p.add_argument("--weights", default="gol.pt",
+    p.add_argument("--weights", default="best_22.pt",
                    help="YOLO weights file")
     p.add_argument("--conf", type=float, default=0.65,
                    help="YOLO confidence threshold")
@@ -1671,9 +1639,6 @@ Examples:
                    help="Port for live browser feed (default 5000)")
 
     # ── Mission limits ──
-    p.add_argument("--time-limit", type=float, default=MISSION_TIME_LIMIT,
-                   help=f"Global mission timer in seconds — RTL if exceeded "
-                        f"(default {MISSION_TIME_LIMIT})")
     p.add_argument("--cross-dist", type=float, default=CROSS_PROBE_DIST,
                    help=f"Cross-sweep leg distance in meters (default {CROSS_PROBE_DIST})")
 
