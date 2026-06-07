@@ -1623,9 +1623,9 @@ Examples:
                    help=f"Altitude to hover and drop payload (default {DROP_ALT_DEFAULT})")
 
     # ── YOLO ──
-    p.add_argument("--weights", default="best_22.pt",
+    p.add_argument("--weights", default="gol.pt",
                    help="YOLO weights file")
-    p.add_argument("--conf", type=float, default=0.65,
+    p.add_argument("--conf", type=float, default=0.60,
                    help="YOLO confidence threshold")
     p.add_argument("--imgsz", type=int, default=640,
                    help="YOLO input size")
