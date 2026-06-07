@@ -1034,9 +1034,9 @@ def main(args):
                 step_num = yaw_scan_step + 1
                 log(log_f, f"ROTATION SCAN step {step_num}/4 — rotating 90° CCW")
 
-                target_hdg = normalize_heading(fc.heading - YAW_STEP_DEG)
+                target_hdg = normalize_heading(fc.heading + YAW_STEP_DEG)
                 if not args.dry_run:
-                    send_yaw(fc, YAW_STEP_DEG, YAW_SPEED, -1, relative=True)
+                    send_yaw(fc, YAW_STEP_DEG, YAW_SPEED, 1, relative=True)
                     timeout = max(YAW_STEP_DEG / YAW_SPEED * 2, 15)
                     wait_yaw_complete(fc, target_hdg, timeout=timeout)
 
